@@ -1,0 +1,73 @@
+{
+  "movable_boxes": [
+    {
+      "body": "box_pink",
+      "color": "pink",
+      "color_zh": "粉色",
+      "kind": "cuboid_box",
+      "location": "table",
+      "gs_ply": "material/pink_box_fit.ply",
+      "half_size": [0.12, 0.08, 0.095],
+      "world_position": [-1.00, 2.20, 0.834],
+      "euler": [0, 0, 0]
+    },
+    {
+      "body": "box_yellow",
+      "color": "yellow",
+      "color_zh": "黄色",
+      "kind": "cuboid_box",
+      "location": "table",
+      "gs_ply": "material/yellow_box_fit.ply",
+      "half_size": [0.12, 0.08, 0.095],
+      "world_position": [-0.54, 2.30, 1.004]
+    },
+    {
+      "body": "box_brown",
+      "color": "brown",
+      "color_zh": "褐色",
+      "kind": "cuboid_box",
+      "location": "shelf",
+      "gs_ply": "material/brown_box_fit.ply",
+      "half_size": [0.12, 0.08, 0.095],
+      "world_position": [-2.63, 0.778, 0.837]
+    }
+  ],
+  "fixed_props": [
+    {
+      "body": "prop_material_box",
+      "prop": "material_box",
+      "prop_zh": "物料盒",
+      "kind": "box",
+      "obstacle_kind": "cube",
+      "obstacle_zh": "正方体障碍块",
+      "location": "table",
+      "gs_ply": "material/material_box_fit.ply",
+      "half_size": [0.092, 0.1205, 0.085],
+      "world_position": [-0.54, 2.30, 0.824]
+    },
+    {
+      "body": "prop_packaging_box",
+      "prop": "packaging_box",
+      "prop_zh": "包装盒",
+      "kind": "box",
+      "obstacle_kind": "cuboid",
+      "obstacle_zh": "长方体障碍物",
+      "location": "shelf",
+      "euler": [1.5708, 0, 0],
+      "gs_ply": "material/packaging_box_fit.ply",
+      "half_size": [0.0887, 0.1170, 0.0510],
+      "world_position": [-2.63, 0.778, 0.530]
+    }
+  ],
+  "scene": {
+    "floor_z": 0.0,
+    "table_top_z": 0.739,
+    "shelf_board_surfaces_z": [0.403, 0.732, 1.061, 1.366, 1.695, 2.024],
+    "start_xy": [-0.70, 0.55],
+    "start_yaw_rad": 1.5708,
+    "picking_zone": {"x": [-2.45, -1.55], "y": [-0.02, 1.42]},
+    "delivery_zone": {"x": [-1.58, 0.32], "y": [1.25, 1.85]},
+    "end_zone": {"x": [-1.15, -0.25], "y": [0.10, 1.00]},
+    "table_place_zone": {"x": [-1.37, 0.29], "y": [1.92, 2.71], "z": [0.74, 1.05]}
+  }
+}

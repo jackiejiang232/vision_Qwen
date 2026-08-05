@@ -1,0 +1,38 @@
+[
+  {
+    "index": 0,
+    "label": "pink box",
+    "dino_score": 0.6360785961151123,
+    "sam_score": 0.9977566003799438,
+    "box_xyxy": [
+      217.5084228515625,
+      538.4085693359375,
+      1181.2537841796875,
+      1402.9090576171875
+    ],
+    "mask_area": 475182,
+    "centroid_uv": [
+      630.3908186757916,
+      947.651775530218
+    ],
+    "mask_path": "/media/jiangzhenmin/系统/JZM/Vision/output/mask_000.png"
+  },
+  {
+    "index": 1,
+    "label": "brown box",
+    "dino_score": 0.6663581132888794,
+    "sam_score": 0.9990559220314026,
+    "box_xyxy": [
+      841.1329345703125,
+      664.5481567382812,
+      1815.5914306640625,
+      1561.384033203125
+    ],
+    "mask_area": 611137,
+    "centroid_uv": [
+      1322.789997987358,
+      1102.6236163086182
+    ],
+    "mask_path": "/media/jiangzhenmin/系统/JZM/Vision/output/mask_001.png"
+  }
+]

@@ -1,0 +1,26 @@
+FROM crpi-1pzq998p9m7w0auy.cn-hangzhou.personal.cr.aliyuncs.com/challengecup/material_sorting:latest
+
+ENV CUDA_HOME=/usr/local/cuda
+ENV TORCH_CUDA_ARCH_LIST=8.9
+ENV MAX_JOBS=4
+
+RUN python3 -m pip install --no-cache-dir \
+    transformers==4.30.2 \
+    tokenizers==0.13.3 \
+    addict==2.4.0 \
+    yapf \
+    timm \
+    supervision==0.29.1 \
+    pycocotools
+
+WORKDIR /media/jiangzhenmin/系统/JZM
+
+COPY GroundingDINO ./GroundingDINO
+COPY segment-anything ./segment-anything
+
+RUN rm -rf GroundingDINO/build \
+    GroundingDINO/*.egg-info \
+    GroundingDINO/groundingdino/_C*.so && \
+    python3 -m pip install -e GroundingDINO \
+        --no-build-isolation --no-deps && \
+    python3 -m pip install -e segment-anything --no-deps

@@ -1,0 +1,9 @@
+[
+  {
+    "task": 1,
+    "target_color": "pink",
+    "target_body": "pink_box",
+    "place_type": "shelf_empty_layer",
+    "place_world": [-2.55, 0.78, 1.15]
+  }
+]

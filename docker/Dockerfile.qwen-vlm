@@ -1,0 +1,19 @@
+FROM crpi-1pzq998p9m7w0auy.cn-hangzhou.personal.cr.aliyuncs.com/challengecup/material_sorting:latest
+
+WORKDIR /opt/qwen_vlm
+
+COPY Vision/requirements/qwen-vlm.txt /opt/qwen_vlm/requirements.txt
+
+RUN python3 -m pip install \
+    --no-cache-dir \
+    -r /opt/qwen_vlm/requirements.txt
+
+COPY Vision/vlm /opt/qwen_vlm/vlm
+
+ENV PYTHONPATH=/opt/qwen_vlm
+ENV HF_HOME=/LLM/huggingface
+ENV TRANSFORMERS_OFFLINE=1
+ENV HF_HUB_OFFLINE=1
+ENV PYTHONUNBUFFERED=1
+
+CMD ["bash"]

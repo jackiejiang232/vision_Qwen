@@ -1,0 +1,17 @@
+{
+  "source_stamp": {
+    "sec": 1,
+    "nanosec": 1
+  },
+  "detections": [
+    {
+      "object_id": "1_1_0",
+      "label": "pink box",
+      "dino_score": 0.86,
+      "sam_score": 0.94,
+      "box_xyxy": [120, 80, 340, 290],
+      "mask_area": 18324,
+      "centroid_uv": [228.4, 184.7]
+    }
+  ]
+}
