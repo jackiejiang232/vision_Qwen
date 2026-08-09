@@ -140,6 +140,11 @@ class SceneObject(StrictModel):
     sam_score: Optional[float] = None
     pose_world: Optional[dict] = None
     size_3d: Optional[dict] = None
+    yaw_world_rad: Optional[float] = None
+    position_std_m: Optional[float] = None
+    yaw_std_rad: Optional[float] = None
+    source_cameras: List[str] = Field(default_factory=list)
+    observed_at: Optional[float] = None
 
 
 class GroundingDecision(StrictModel):
@@ -174,6 +179,11 @@ class TaskTargetBinding(StrictModel):
     shelf_layer_confidence: Optional[float] = None
     confidence: float = 0.0
     requires_reobserve: bool = False
+    yaw_world_rad: Optional[float] = None
+    position_std_m: Optional[float] = None
+    yaw_std_rad: Optional[float] = None
+    source_cameras: List[str] = Field(default_factory=list)
+    observed_at: Optional[float] = None
 
 
 class PlaceGoalBinding(StrictModel):

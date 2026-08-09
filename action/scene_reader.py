@@ -1,8 +1,131 @@
 import json
 
+def _surface_from_flat_scene(scene):
+    source = str(scene.get("source_location") or "").lower()
+
+    if scene.get("on_shelf") or "shelf" in source:
+        return "shelf"
+    if scene.get("on_table") or "table" in source:
+        return "table"
+
+    return None
+
+def _normalize_flat_scene(scene):
+    """
+    兼容新的扁平 scene_understanding 输出。
+
+    新格式示例：
+    {
+      "task_id": 1,
+      "target_object_id": "...",
+      "target_label": "pink box",
+      "target_pose_world": {...},
+      "source_location": "table",
+      "place_type": "shelf_layer",
+      ...
+    }
+
+    转成动作节点原来需要的：
+    active_task_id + task_queue + objects + grounding
+    """
+    task_id = scene.get("task_id")
+    target_object_id = scene.get("target_object_id")
+    target_label = scene.get("target_label")
+    target_pose_world = scene.get("target_pose_world")
+    requires_reobserve = bool(scene.get("requires_reobserve", True))
+    support_surface = _surface_from_flat_scene(scene)
+
+    target = {
+        "object_id": target_object_id,
+        "label": target_label,
+        "color": scene.get("target_color"),
+        "category": scene.get("target_category"),
+        "pose_world": target_pose_world,
+        "size_3d": scene.get("target_size_3d") or scene.get("size_3d"),
+        "source_location": scene.get("source_location"),
+        "support_surface": support_surface,
+        "on_table": scene.get("on_table"),
+        "on_shelf": scene.get("on_shelf"),
+        "shelf_layer": scene.get("shelf_layer"),
+        "confidence": scene.get("confidence", 0.0),
+        "requires_reobserve": requires_reobserve,
+    }
+
+    place_goal = {
+        "type": scene.get("place_type"),
+        "place_type": scene.get("place_type"),
+        "reference_object_id": scene.get("reference_object_id"),
+        "reference_label": scene.get("reference_label"),
+        "spatial_relation": scene.get("spatial_relation"),
+        "pose_world": scene.get("place_pose_world"),
+        "requires_planning": True,
+    }
+
+    objects = []
+    if target_object_id and target_pose_world:
+        objects.append(
+            {
+                "object_id": target_object_id,
+                "label": target_label,
+                "semantic_role": "active_task_target",
+                "location": support_surface or "unknown",
+                "pose_world": target_pose_world,
+                "size_3d": target.get("size_3d"),
+                "support_surface": support_surface,
+                "on_table": scene.get("on_table"),
+                "on_shelf": scene.get("on_shelf"),
+                "shelf_layer": scene.get("shelf_layer"),
+                "confidence": scene.get("confidence", 0.0),
+                "dino_score": scene.get("confidence", 0.0),
+                "requires_reobserve": requires_reobserve,
+            }
+        )
+
+    return {
+        "schema_version": "flat_compat_1.0",
+        "source_stamp_sec": scene.get("source_stamp_sec", 0),
+        "source_stamp_nanosec": scene.get("source_stamp_nanosec", 0),
+        "active_task_id": task_id,
+        "scene_summary": (
+            f"兼容扁平scene：任务{task_id}，目标{target_label}"
+        ),
+        "objects": objects,
+        "grounding": {
+            "selected_object_id": target_object_id,
+            "selected_label": target_label,
+            "reason": "flat_scene_compat",
+            "confidence": scene.get("confidence", 0.0),
+            "requires_reobserve": requires_reobserve,
+        },
+        "task_queue": [
+            {
+                "task_id": task_id,
+                "status": "pending",
+                "original_instruction": scene.get("original_instruction", ""),
+                "target": target,
+                "place_goal": place_goal,
+                "uncertainties": (
+                    ["target_requires_reobserve"]
+                    if requires_reobserve
+                    else []
+                ),
+            }
+        ],
+    }
+
 
 def parse_scene_message(message_data):
-    return json.loads(message_data)
+    scene = json.loads(message_data)
+
+    # 旧格式：直接返回
+    if "task_queue" in scene or "active_task_id" in scene:
+        return scene
+
+    # 新扁平格式：自动补成动作模块需要的旧格式
+    if "task_id" in scene and "target_object_id" in scene:
+        return _normalize_flat_scene(scene)
+
+    return scene
 
 
 def get_active_task(scene):
@@ -237,6 +360,11 @@ def _copy_detection_to_target(target, detection, score):
             ),
             "confidence": float(score),
             "requires_reobserve": False,
+            "yaw_world_rad": detection.get("yaw_world_rad"),
+            "position_std_m": detection.get("position_std_m"),
+            "yaw_std_rad": detection.get("yaw_std_rad"),
+            "source_cameras": detection.get("source_cameras"),
+            "observed_at": detection.get("observed_at"),
         }
     )
     return target

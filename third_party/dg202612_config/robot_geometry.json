@@ -1,0 +1,107 @@
+{
+  "schema_version": 2,
+  "confirmed": false,
+  "confirmed_scope": "dock_only",
+  "confirmation_required": "请先在官方镜像中核对底盘外形、左右工具坐标系和箱体 pose 的定义；此文件不能用手调抓取点替代几何标定。",
+  "calibration": {
+    "source": {
+      "kind": "official_image_source",
+      "image_digest": "sha256:5d525c90169bdf373f112f876ab2e7e45790291ac89f436a221f8b9020c59ed4",
+      "files": [
+        "/workspace/material_sorting_task/examples/material_sorting/mmk2_kdl.py",
+        "/workspace/material_sorting_task/examples/material_sorting/arm_kdl.py",
+        "/workspace/material_sorting_task/examples/material_sorting/mjcf/material_competition.xml"
+      ],
+      "inspected_at": "2026-07-25",
+      "status": "dock_geometry_source_confirmed_tool_frames_pending"
+    },
+    "confirmation_method": "source_inspection_only",
+    "confirmation_note": "DOCK 只依赖 base_footprint 与 world_to_base，二者经官方 MJCF/mmk2_kdl 源码核对 + 纸面自洽（车头至桌边余6cm不重叠、底盘外接半径0.301m 与 safety_margin 0.35m 对得上），标为已确认。左右工具坐标系与箱体 pose 约定属抓取标定（阶段4–6），仍为 null/未确认，抓取前不得当已确认使用。",
+    "confirmed_by": "Hai Kuo（信任官方源码，未做 GUI 比对）",
+    "confirmed_at": "2026-07-25",
+    "checks": {
+      "base_footprint": true,
+      "world_to_base": true,
+      "left_tool_frame": false,
+      "right_tool_frame": false,
+      "box_pose_convention": false
+    },
+    "evidence": [
+      {
+        "kind": "paper_consistency_check",
+        "at": "2026-07-25",
+        "detail": "base 矩形 0.42×0.40、外接半径0.301m 与 scene safety_margin 0.35m 自洽；停靠 yaw90° 时车头 y≈1.855 < 桌边 1.915，余6cm。工具变换未验，抓取阶段再补。"
+      }
+    ]
+  },
+  "world_frame": "world",
+  "base_footprint": {
+    "shape": "rectangle",
+    "center_offset_xy": [-0.015, 0.0],
+    "half_extents_xy": [0.21, 0.2],
+    "bounds_in_base": [-0.225, -0.2, 0.195, 0.2],
+    "circumscribed_radius": 0.301
+  },
+  "slide_range": [-0.04, 0.87],
+  "arm_joint_order": [
+    "joint1",
+    "joint2",
+    "joint3",
+    "joint4",
+    "joint5",
+    "joint6"
+  ],
+  "arm_joint_limits": [
+    [-3.151, 2.08],
+    [-2.963, 0.181],
+    [-0.094, 3.161],
+    [-3.012, 3.012],
+    [-1.859, 1.859],
+    [-3.017, 3.017]
+  ],
+  "official_ik_vector_order": [
+    "slide",
+    "left_joint1",
+    "left_joint2",
+    "left_joint3",
+    "left_joint4",
+    "left_joint5",
+    "left_joint6",
+    "right_joint1",
+    "right_joint2",
+    "right_joint3",
+    "right_joint4",
+    "right_joint5",
+    "right_joint6"
+  ],
+  "official_control_vector_order": [
+    "base_linear",
+    "base_angular",
+    "slide",
+    "head_yaw",
+    "head_pitch",
+    "left_joint1",
+    "left_joint2",
+    "left_joint3",
+    "left_joint4",
+    "left_joint5",
+    "left_joint6",
+    "left_gripper",
+    "right_joint1",
+    "right_joint2",
+    "right_joint3",
+    "right_joint4",
+    "right_joint5",
+    "right_joint6",
+    "right_gripper"
+  ],
+  "gripper_command_range": [0.0, 1.0],
+  "left_tool_transform": null,
+  "right_tool_transform": null,
+  "box_pose_convention": "box geometry center in world frame; verify before setting confirmed=true",
+  "notes": {
+    "base_footprint": "尺寸来自官方 MJCF 碰撞几何；仍需在 MuJoCo 俯视图核对方向与偏置。",
+    "joint_limits": "来自官方 arm_kdl.py；运行时仍应从实际 joint_states 核对关节顺序。",
+    "tool_transforms": "尚未确认，不能把官方 baseline 的末端旋转矩阵误写成腕部到接触面的完整工具变换。"
+  }
+}

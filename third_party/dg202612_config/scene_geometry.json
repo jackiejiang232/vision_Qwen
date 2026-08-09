@@ -1,0 +1,65 @@
+{
+  "schema_version": 2,
+  "confirmed": true,
+  "confirmation_required": "请在官方仿真中人工确认 world 坐标、墙、桌、货架、固定禁入区、机器人安全半径后再填写；不要填入随机箱子位置或任务专用路点。",
+  "calibration": {
+    "source": {
+      "kind": "official_image_source",
+      "image_digest": "sha256:5d525c90169bdf373f112f876ab2e7e45790291ac89f436a221f8b9020c59ed4",
+      "file": "/workspace/material_sorting_task/examples/material_sorting/mjcf/material_competition.xml",
+      "inspected_at": "2026-07-25",
+      "status": "source_confirmed_by_inspection"
+    },
+    "confirmation_method": "source_inspection_only",
+    "confirmation_note": "值经官方 MJCF 源码核对 + 纸面自洽检查（箱坐落桌面、箱在桌内、停靠位对齐且不撞桌、障碍块=桌/货架占地）通过；未在 MuJoCo GUI 做肉眼比对。若后续开容器看图，请复核并补 evidence。",
+    "confirmed_by": "Hai Kuo（信任官方源码，未做 GUI 比对）",
+    "confirmed_at": "2026-07-25",
+    "checks": {
+      "world_axes": true,
+      "field_bounds": true,
+      "table_geometry": true,
+      "shelf_geometry": true,
+      "fixed_obstacles": true
+    },
+    "evidence": [
+      {
+        "kind": "paper_consistency_check",
+        "at": "2026-07-25",
+        "detail": "箱心 z0.834=桌面0.739+半箱高0.095；箱(-1.0,2.2)在桌 x[-1.37,0.29]/y[1.915,2.715] 内；停靠(-1.0,1.66,90°)与箱同 x、距桌边0.255m、车头至桌边余6cm不重叠；A* 障碍块=桌/货架占地。"
+      }
+    ]
+  },
+  "world_frame": "world",
+  "map": {
+    "bounds": [-2.9, -0.37, 0.4, 2.87],
+    "resolution": 0.05,
+    "safety_margin": 0.35
+  },
+  "static_obstacles": [
+    [-2.875, 0.37, -2.465, 1.186],
+    [-1.37, 1.915, 0.29, 2.715]
+  ],
+  "forbidden_zones": [],
+  "fixed_geometry": {
+    "inner_wall_faces": {
+      "west_x": -2.9,
+      "east_x": 0.4,
+      "south_y": -0.37,
+      "north_y": 2.87
+    },
+    "table": {
+      "footprint": [-1.37, 1.915, 0.29, 2.715],
+      "surface_z": 0.739
+    },
+    "shelf": {
+      "footprint": [-2.875, 0.37, -2.465, 1.186],
+      "board_center_z": [0.403, 0.732, 1.061, 1.366, 1.695, 2.024]
+    },
+    "standard_box_size": [0.24, 0.16, 0.19]
+  },
+  "planner_notes": {
+    "resolution": "0.05 m 是当前透明 A* 网格选择，不是赛事方规定。",
+    "safety_margin": "0.35 m = 约 0.301 m 底盘外接半径加 0.049 m 候选余量；必须经路径图和 MuJoCo 人工确认。",
+    "random_objects_excluded": true
+  }
+}

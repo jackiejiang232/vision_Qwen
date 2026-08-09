@@ -33,6 +33,11 @@ SURFACE_FIELDS = (
     "table_height_confidence",
     "pose_world",
     "size_3d",
+    "yaw_world_rad",
+    "position_std_m",
+    "yaw_std_rad",
+    "source_cameras",
+    "observed_at",
 )
 
 

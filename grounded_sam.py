@@ -64,8 +64,8 @@ except ImportError:
 # 路径配置
 # =========================
 
-DINO_ROOT = Path("/media/jiangzhenmin/系统/JZM/GroundingDINO")
-SAM_ROOT = Path("/media/jiangzhenmin/系统/JZM/segment-anything")
+DINO_ROOT = Path("/media/jiangzhenmin/data/Challengecup2026/JZM/GroundingDINO")
+SAM_ROOT = Path("/media/jiangzhenmin/data/Challengecup2026/JZM/segment-anything")
 
 DINO_CONFIG = (
     DINO_ROOT
@@ -83,11 +83,11 @@ SAM_CHECKPOINT = (
 )
 
 DEFAULT_IMAGE = Path(
-    "/media/jiangzhenmin/系统/JZM/Vision/input/box.png"
+    "/media/jiangzhenmin/data/Challengecup2026/JZM/Vision/input/box.png"
 )
 
 DEFAULT_OUTPUT = Path(
-    "/media/jiangzhenmin/系统/JZM/Vision/output"
+    "/media/jiangzhenmin/data/Challengecup2026/JZM/Vision/output"
 )
 
 
@@ -522,7 +522,7 @@ def infer_frame(
         image_width=width,
         image_height=height,
         min_area_ratio=0.002,
-        max_area_ratio=0.98,
+        max_area_ratio=1.0,
     )
 
     image_rgb = cv2.cvtColor(
@@ -1342,17 +1342,44 @@ class GroundedSamCameraNode(Node):
                 record["contract_missing"] = missing
 
             if header is not None:
-                frame_key = (
-                    f"{header.stamp.sec}_"
-                    f"{header.stamp.nanosec}"
-                )
+                    frame_key = (
+                        f"{header.stamp.sec}_"
+                        f"{header.stamp.nanosec}"
+                    )
+
+                    # 当前检测帧对应的ROS时间，单位为秒。
+                    observed_at = (
+                        float(header.stamp.sec)
+                        + float(header.stamp.nanosec) * 1e-9
+                    )
             else:
-                frame_key = str(sequence)
+                    frame_key = str(sequence)
+
+                    # 没有ROS Header时使用当前系统时间兜底。
+                    observed_at = time.time()
 
             for index, record in enumerate(records):
-                record["object_id"] = (
-                    f"{frame_key}_{index}"
-                )
+                    # 当前帧内每个目标的唯一ID。
+                    record["object_id"] = (
+                        f"{frame_key}_{index}"
+                    )
+
+                    # 该检测结果来自头部RGB-D相机。
+                    record["source_cameras"] = ["head_rgbd"]
+
+                    # 当前目标的实际观测时间。
+                    record["observed_at"] = float(observed_at)
+
+                    # 第一版暂时没有从点云估计箱体真实yaw。
+                    # 这里的0.0只是接口兜底值，不代表真实朝向。
+                    record["yaw_world_rad"] = 0.0
+
+                    # 第一版还没有做多帧位置稳定性统计。
+                    record["position_std_m"] = None
+
+                    # 第一版还没有做多帧yaw稳定性统计。
+                    record["yaw_std_rad"] = None
+
             self.scene_memory.update_from_detections(records)
             display_phrases = [
                 record.get("corrected_label") or record.get("label")

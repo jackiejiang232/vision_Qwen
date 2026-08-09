@@ -11,13 +11,16 @@ from sensor_msgs.msg import JointState
 from std_msgs.msg import String
 from scipy.spatial.transform import Rotation
 from .active_observer import ActiveObserver
+from .motion_astar_nav import make_dock_controller
 
 from .action_config import CONFIG
 from .goal_builder import (
     Pose2D,
     build_approach_goal_from_target,
     build_search_goal,
+    pose2d_from_motion_handoff,
 )
+from .motion_handoff_adapter import build_motion_handoff
 from .scene_reader import (
     bind_task_target_from_objects,
     choose_search_areas,
@@ -56,6 +59,7 @@ class ActionNavigationNode(Node):
         self.latest_scene_time = 0.0
         self.latest_detection_scene = None
         self.latest_detection_time = 0.0
+        self.latest_detection_seq = 0
         self.active_task = None
         self.current_goal = None
         self.robot_pose = None
@@ -76,6 +80,16 @@ class ActionNavigationNode(Node):
         self.pregrasp_target_spine = None
         self.pregrasp_target_head_pitch = None
         self.head_state_time = 0.0
+        self.current_dock_route = None
+        self.current_dock_controller = None
+        self.motion_astar_enabled = False
+        self.motion_astar_waypoint_count = 0
+        self.motion_astar_cost_m = 0.0
+        self.last_dock_progress = None
+        self.motion_target_metadata = {}
+        self.current_motion_metadata = {}
+        self.motion_task_metadata = {}
+        self.grasp_handoff_active = False
 
         self.cmd_vel_pub = self.create_publisher(
             Twist,
@@ -110,6 +124,18 @@ class ActionNavigationNode(Node):
             JointState,
             self.config.joint_state_topic,
             self.on_joint_state,
+            10,
+        )
+        self.grasp_command_sub = self.create_subscription(
+            String,
+            self.config.grasp_command_topic,
+            self.on_grasp_command,
+            10,
+        )
+        self.grasp_status_sub = self.create_subscription(
+            String,
+            self.config.grasp_status_topic,
+            self.on_grasp_status,
             10,
         )
 
@@ -169,9 +195,11 @@ class ActionNavigationNode(Node):
         try:
             payload = json.loads(msg.data)
             source_stamp = payload.get("source_stamp") or {}
+            self.latest_detection_seq += 1
             self.latest_detection_scene = {
                 "source_stamp_sec": source_stamp.get("sec"),
                 "source_stamp_nanosec": source_stamp.get("nanosec"),
+                "observation_seq": self.latest_detection_seq,
                 "objects": payload.get("detections") or [],
             }
             self.latest_detection_time = time.monotonic()
@@ -217,6 +245,41 @@ class ActionNavigationNode(Node):
                 self.head_state_time = now
         except ValueError:
             pass
+
+    def on_grasp_command(self, msg):
+        command = msg.data.strip().lower()
+        if command == "start" and self.phase == Phase.READY_FOR_GRASP:
+            self.enter_grasp_handoff("grasp_start_command")
+        elif command == "abort":
+            self.exit_grasp_handoff("grasp_abort_command")
+
+    def on_grasp_status(self, msg):
+        try:
+            payload = json.loads(msg.data)
+        except json.JSONDecodeError:
+            return
+
+        event = str(payload.get("event") or "")
+        state = str(payload.get("state") or "")
+        if event == "safe_stop" or state == "SAFE_STOP":
+            self.exit_grasp_handoff("grasp_executor_safe_stop")
+
+    def enter_grasp_handoff(self, reason):
+        if not self.grasp_handoff_active:
+            self.get_logger().info(
+                f"enter grasp handoff: {reason}"
+            )
+        self.grasp_handoff_active = True
+        self.navigator.stop()
+        self.visual_servo.stop(reset_stability=False)
+        self.cmd_vel_pub.publish(Twist())
+
+    def exit_grasp_handoff(self, reason):
+        if self.grasp_handoff_active:
+            self.get_logger().info(
+                f"exit grasp handoff: {reason}"
+            )
+        self.grasp_handoff_active = False
 
     def target_is_table_target(self, target):
         return not (
@@ -341,7 +404,152 @@ class ActionNavigationNode(Node):
                 math.cos(yaw_error),
             )
         )
-    
+
+    def close_range_lock_ready(self, target):
+        if not getattr(self.config, "close_range_lock_enable", True):
+            return False
+
+        if not target or not self.target_is_table_target(target):
+            return False
+
+        if not self.target_pose_valid_for_surface(target):
+            return False
+
+        errors = self.table_pregrasp_alignment_errors(target)
+        if errors is None:
+            return False
+
+        table_yaw_error = self.table_front_yaw_error()
+        if table_yaw_error is None:
+            return False
+
+        distance_extra = float(
+            getattr(self.config, "close_range_lock_extra_distance_m", 0.08)
+        )
+        forward_min = max(
+            0.0,
+            float(self.config.table_grasp_distance_min) - distance_extra,
+        )
+        forward_max = (
+            float(self.config.table_grasp_distance_max)
+            + distance_extra
+        )
+        lateral_tolerance = float(
+            getattr(
+                self.config,
+                "close_range_lock_lateral_tolerance_m",
+                self.config.table_pregrasp_lateral_tolerance_m,
+            )
+        )
+        heading_tolerance = float(
+            getattr(
+                self.config,
+                "close_range_lock_heading_tolerance_rad",
+                self.config.table_pregrasp_heading_tolerance_rad,
+            )
+        )
+        table_yaw_tolerance = float(
+            getattr(
+                self.config,
+                "close_range_lock_table_yaw_tolerance_rad",
+                self.config.table_pregrasp_table_yaw_tolerance_rad,
+            )
+        )
+
+        return (
+            forward_min <= float(errors["forward_m"]) <= forward_max
+            and abs(float(errors["lateral_m"])) <= lateral_tolerance
+            and abs(float(errors["heading_rad"])) <= heading_tolerance
+            and table_yaw_error <= table_yaw_tolerance
+        )
+
+    def close_range_lock_target(self, preferred_target=None):
+        candidates = (
+            preferred_target,
+            self.recent_servo_target(),
+            self.approach_target_snapshot,
+            self.ready_target_snapshot,
+        )
+
+        for candidate in candidates:
+            if not candidate:
+                continue
+
+            target = dict(candidate)
+            target = self.restore_motion_metadata(target)
+            target = self.apply_pregrasp_metadata(target)
+            if self.close_range_lock_ready(target):
+                target["close_range_locked"] = True
+                return target
+
+        return None
+    def remember_motion_metadata(self, target):
+        if not target:
+            return
+
+        keys = (
+            "motion_source_area",
+            "motion_grasp_profile",
+            "motion_astar_enabled",
+            "motion_astar_waypoint_count",
+            "motion_astar_cost_m",
+        )
+
+        metadata = {
+            key: target.get(key)
+            for key in keys
+            if target.get(key) is not None
+        }
+
+        if not metadata:
+            return
+
+        # 1. 当前任务级缓存：最稳，因为 active_task_id 不随检测帧变化。
+        self.current_motion_metadata = dict(metadata)
+
+        task_id = None
+        if self.active_task is not None:
+            task_id = self.active_task.get("task_id")
+
+        if task_id is not None:
+            self.motion_task_metadata[task_id] = dict(metadata)
+
+        # 2. object_id 缓存保留，但只作为辅助。
+        object_id = target.get("object_id")
+        if object_id:
+            self.motion_target_metadata[object_id] = dict(metadata)
+
+
+    def restore_motion_metadata(self, target):
+        if not target:
+            return target
+
+        metadata = None
+
+        object_id = target.get("object_id")
+        if object_id:
+            metadata = self.motion_target_metadata.get(object_id)
+
+        if metadata is None and self.active_task is not None:
+            task_id = self.active_task.get("task_id")
+            metadata = self.motion_task_metadata.get(task_id)
+
+        if metadata is None:
+            metadata = self.current_motion_metadata
+
+        if not metadata:
+            return target
+
+        target = dict(target)
+
+        # 注意：不能用 setdefault。
+        # 如果 key 已经存在但值是 None，setdefault 不会覆盖。
+        for key, value in metadata.items():
+            if target.get(key) is None:
+                target[key] = value
+
+        return target
+
     def apply_pregrasp_metadata(self, target):
         if not target or self.current_goal is None:
             return target
@@ -397,8 +605,7 @@ class ActionNavigationNode(Node):
         self.servo_target_snapshot_time = time.monotonic()
         if self.latest_detection_scene is not None:
             self.servo_target_observation_id = (
-                self.latest_detection_scene.get("source_stamp_sec"),
-                self.latest_detection_scene.get("source_stamp_nanosec"),
+                self.latest_detection_scene.get("observation_seq"),
             )
 
     def recent_servo_target(self):
@@ -425,23 +632,67 @@ class ActionNavigationNode(Node):
         if table_yaw_error is None:
             return False
 
+        distance_min = float(self.config.table_grasp_distance_min)
+        distance_max = float(self.config.table_grasp_distance_max)
+        lateral_tolerance = float(
+            self.config.table_pregrasp_lateral_tolerance_m
+        )
+        heading_tolerance = float(
+            self.config.table_pregrasp_heading_tolerance_rad
+        )
+        table_yaw_tolerance = float(
+            self.config.table_pregrasp_table_yaw_tolerance_rad
+        )
+
+        if target.get("close_range_locked"):
+            distance_extra = float(
+                getattr(
+                    self.config,
+                    "close_range_lock_extra_distance_m",
+                    0.08,
+                )
+            )
+            distance_min = max(0.0, distance_min - distance_extra)
+            distance_max = distance_max + distance_extra
+            lateral_tolerance = float(
+                getattr(
+                    self.config,
+                    "close_range_lock_lateral_tolerance_m",
+                    lateral_tolerance,
+                )
+            )
+            heading_tolerance = float(
+                getattr(
+                    self.config,
+                    "close_range_lock_heading_tolerance_rad",
+                    heading_tolerance,
+                )
+            )
+            table_yaw_tolerance = float(
+                getattr(
+                    self.config,
+                    "close_range_lock_table_yaw_tolerance_rad",
+                    table_yaw_tolerance,
+                )
+            )
+
         if (
             table_yaw_error
-            > self.config.table_pregrasp_table_yaw_tolerance_rad
+            > table_yaw_tolerance
         ):
             return False
 
         if not (
-            self.config.table_grasp_distance_min
+            distance_min
             <= forward_m
-            <= self.config.table_grasp_distance_max
+            <= distance_max
         ):
             return False
 
-        if lateral_m > self.config.table_pregrasp_lateral_tolerance_m:
+        if lateral_m > lateral_tolerance:
             return False
 
-        if heading_rad > self.config.table_pregrasp_heading_tolerance_rad:
+        if heading_rad > heading_tolerance:
             return False
 
         return True
@@ -488,8 +739,7 @@ class ActionNavigationNode(Node):
             get_active_task(self.latest_scene),
         )
         observation_id = (
-            self.latest_detection_scene.get("source_stamp_sec"),
-            self.latest_detection_scene.get("source_stamp_nanosec"),
+            self.latest_detection_scene.get("observation_seq"),
         )
         confirmed_target = self.search_target_lock.update(
             task,
@@ -534,6 +784,7 @@ class ActionNavigationNode(Node):
         expected_spine = None
         table_distance = None
         if target:
+            target = self.restore_motion_metadata(target)
             target = self.apply_pregrasp_metadata(target)
             expected_spine = self.expected_table_spine(target)
             table_distance = self.table_target_distance(target)
@@ -561,6 +812,8 @@ class ActionNavigationNode(Node):
             "table_target_distance": table_distance,
             "arm_clearance_ready": self.grasp_clearance_ready(target),
             "grasp_window_ready": self.grasp_window_ready(target),
+            "close_range_locked": bool(target.get("close_range_locked")),
+            "close_range_lock_ready": self.close_range_lock_ready(target),
             "base_goal_pose": (
                 self.current_goal.__dict__
                 if self.current_goal is not None
@@ -570,6 +823,9 @@ class ActionNavigationNode(Node):
             "has_odom": self.robot_pose is not None,
             "semantic_age_sec": semantic_age,
             "detection_age_sec": detection_age,
+            "detection_seq": self.latest_detection_seq,
+            "visual_servo_stable_frames": self.visual_servo.stable_frames,
+            "visual_servo_last_observation_id": self.visual_servo.last_observation_id,
             "reason": reason,
             "navigation_mode": self.navigation_mode,
             "search_area": (
@@ -595,6 +851,27 @@ class ActionNavigationNode(Node):
             "table_pregrasp_alignment": (
                 self.table_pregrasp_alignment_errors(target)
                 if target and self.target_is_table_target(target)
+                else None
+            ),
+            "motion_source_area": target.get("motion_source_area"),
+            "motion_grasp_profile": target.get("motion_grasp_profile"),
+            "target_size_3d": target.get("size_3d"),
+            "target_yaw_world_rad": target.get("yaw_world_rad"),
+            "position_std_m": target.get("position_std_m"),
+            "yaw_std_rad": target.get("yaw_std_rad"),
+             #A*导入
+            "motion_astar_enabled": self.motion_astar_enabled,
+            "motion_astar_waypoint_count": self.motion_astar_waypoint_count,
+            "motion_astar_cost_m": self.motion_astar_cost_m,
+            "motion_dock_progress": (
+                {
+                    "phase": self.last_dock_progress.phase,
+                    "position_error": self.last_dock_progress.position_error,
+                    "yaw_error": self.last_dock_progress.yaw_error,
+                    "stable_for": self.last_dock_progress.stable_for,
+                    "completed": self.last_dock_progress.completed,
+                }
+                if self.last_dock_progress is not None
                 else None
             ),
         }
@@ -700,12 +977,59 @@ class ActionNavigationNode(Node):
             self.approach_retry_count
             * self.config.approach_retry_backoff_m
         )
-        self.current_goal = build_approach_goal_from_target(
-            target,
-            self.config,
-            self.robot_pose,
-            distance_extra=distance_extra,
-        )
+        motion_goal = None
+
+        if self.config.enable_motion_handoff_stance:
+            try:
+                motion_goal = build_motion_handoff(
+                    self.latest_scene,
+                    self.config,
+                    robot_pose=self.robot_pose,
+                )
+            except Exception as error:
+                self.get_logger().warning(
+                    f"DG202612 motion handoff failed, fallback local goal: {error}"
+                )
+
+        if motion_goal is not None and motion_goal.status == "ok":
+            self.current_goal = pose2d_from_motion_handoff(
+                motion_goal.approach_pose
+            )
+
+            self.current_dock_route = motion_goal.dock_route
+            self.current_dock_controller = None
+            self.motion_astar_enabled = bool(motion_goal.astar_enabled)
+            self.motion_astar_waypoint_count = int(
+                motion_goal.astar_waypoint_count
+            )
+            self.motion_astar_cost_m = float(motion_goal.astar_cost_m)
+
+            if self.current_dock_route is not None:
+                self.current_dock_controller = make_dock_controller(
+                    self.current_dock_route,
+                    self.config,
+                )
+
+            target["motion_source_area"] = motion_goal.source_area
+            target["motion_grasp_profile"] = motion_goal.grasp_profile
+            target["motion_astar_enabled"] = self.motion_astar_enabled
+            target["motion_astar_waypoint_count"] = self.motion_astar_waypoint_count
+            target["motion_astar_cost_m"] = self.motion_astar_cost_m
+
+            self.remember_motion_metadata(target)
+        else:
+            self.current_dock_route = None
+            self.current_dock_controller = None
+            self.motion_astar_enabled = False
+            self.motion_astar_waypoint_count = 0
+            self.motion_astar_cost_m = 0.0
+            self.current_goal = build_approach_goal_from_target(
+                target,
+                self.config,
+                self.robot_pose,
+                distance_extra=distance_extra,
+            )
+        target = self.restore_motion_metadata(target)
         target = self.apply_pregrasp_metadata(target)
         self.active_task = dict(self.active_task)
         self.active_task["target"] = target
@@ -789,7 +1113,31 @@ class ActionNavigationNode(Node):
         if self.robot_pose is None or self.current_goal is None:
             self.set_phase(Phase.SAFE_STOP)
             return
+        if (
+            self.navigation_mode == "approach"
+            and self.current_dock_controller is not None
+        ):
+            progress = self.current_dock_controller.update(
+                self.robot_pose,
+                time.monotonic(),
+            )
+            self.last_dock_progress = progress
 
+            msg = Twist()
+            msg.linear.x = float(progress.command.linear)
+            msg.angular.z = float(progress.command.angular)
+            self.cmd_vel_pub.publish(msg)
+
+            if progress.completed:
+                self.navigator.stop()
+                self.arrived_scene_time = self.latest_scene_time
+                self.arrived_detection_time = self.latest_detection_time
+                self.set_phase(Phase.SCAN_AND_REOBSERVE)
+                return
+
+            return
+
+        # 没有 A* route 时，保留原来的 SimpleCmdVelNavigator 逻辑
         if self.navigator.reached(
             self.robot_pose,
             self.current_goal,
@@ -1070,71 +1418,122 @@ class ActionNavigationNode(Node):
         )
     def handle_visual_servo(self):
         if self.latest_detection_scene is None:
-            self.visual_servo.stop()
-            self.publish_ready(False, "visual_servo_waiting_scene")
-            return
-
-        scene_age = time.monotonic() - self.latest_detection_time
-        if scene_age > self.config.servo_scene_max_age_sec:
-            self.visual_servo.stop()
-            self.publish_ready(False, "visual_servo_scene_too_old")
-            self.arrived_scene_time = self.latest_scene_time
-            self.arrived_detection_time = self.latest_detection_time
-            self.observe_resume = True
-            self.set_phase(Phase.SCAN_AND_REOBSERVE)
-            return
-
-        base_task = self.active_task or get_active_task(
-            self.latest_scene
-        )
-        self.active_task = bind_task_target_from_objects(
-            self.latest_detection_scene,
-            base_task,
-        )
-        target = (self.active_task or {}).get("target") or {}
-        current_target_valid = (
-            target_is_detected(self.active_task)
-            and self.target_pose_valid_for_surface(target)
-        )
-
-        if not current_target_valid:
-            recent_target = self.recent_servo_target()
-            if recent_target is None:
+            locked_target = self.close_range_lock_target()
+            if locked_target is None:
                 self.visual_servo.stop()
-                self.publish_ready(
-                    False,
-                    "visual_servo_waiting_fresh_target_detection",
-                )
-                self.arrived_scene_time = self.latest_scene_time
-                self.arrived_detection_time = self.latest_detection_time
-                self.observe_resume = True
-                self.set_phase(Phase.SCAN_AND_REOBSERVE)
+                self.publish_ready(False, "visual_servo_waiting_scene")
                 return
 
-            self.active_task = dict(base_task or {})
-            self.active_task["target"] = recent_target
-            target = recent_target
+            self.active_task = dict(
+                self.active_task
+                or get_active_task(self.latest_scene or {})
+                or {}
+            )
+            self.active_task["target"] = locked_target
+            target = locked_target
+            close_range_locked = True
+            current_target_valid = False
         else:
-            target = self.apply_pregrasp_metadata(target)
-            self.active_task = dict(self.active_task)
-            self.active_task["target"] = target
-            self.remember_servo_target(target)
+            target = None
+            close_range_locked = False
+            current_target_valid = False
 
+        if not close_range_locked:
+            scene_age = time.monotonic() - self.latest_detection_time
+            if scene_age > self.config.servo_scene_max_age_sec:
+                locked_target = self.close_range_lock_target()
+                if locked_target is None:
+                    self.visual_servo.stop()
+                    self.publish_ready(False, "visual_servo_scene_too_old")
+                    self.arrived_scene_time = self.latest_scene_time
+                    self.arrived_detection_time = self.latest_detection_time
+                    self.observe_resume = True
+                    self.set_phase(Phase.SCAN_AND_REOBSERVE)
+                    return
+
+                self.active_task = dict(
+                    self.active_task
+                    or get_active_task(self.latest_scene or {})
+                    or {}
+                )
+                self.active_task["target"] = locked_target
+                target = locked_target
+                close_range_locked = True
+
+        if not close_range_locked:
+            base_task = self.active_task or get_active_task(
+                self.latest_scene
+            )
+            self.active_task = bind_task_target_from_objects(
+                self.latest_detection_scene,
+                base_task,
+            )
+            target = (self.active_task or {}).get("target") or {}
+            current_target_valid = (
+                target_is_detected(self.active_task)
+                and self.target_pose_valid_for_surface(target)
+            )
+
+            if not current_target_valid:
+                recent_target = self.recent_servo_target()
+                locked_target = self.close_range_lock_target(
+                    recent_target
+                )
+                if locked_target is not None:
+                    self.active_task = dict(base_task or {})
+                    self.active_task["target"] = locked_target
+                    target = locked_target
+                    close_range_locked = True
+                elif recent_target is None:
+                    self.visual_servo.stop()
+                    self.publish_ready(
+                        False,
+                        "visual_servo_waiting_fresh_target_detection",
+                    )
+                    self.arrived_scene_time = self.latest_scene_time
+                    self.arrived_detection_time = self.latest_detection_time
+                    self.observe_resume = True
+                    self.set_phase(Phase.SCAN_AND_REOBSERVE)
+                    return
+                else:
+                    self.active_task = dict(base_task or {})
+                    self.active_task["target"] = recent_target
+                    target = recent_target
+
+            else:
+                target = self.apply_pregrasp_metadata(target)
+                self.active_task = dict(self.active_task)
+                self.active_task["target"] = target
+                self.remember_servo_target(target)
+
+        target = self.restore_motion_metadata(target)
         target = self.apply_pregrasp_metadata(target)
         self.active_task = dict(self.active_task or {})
         self.active_task["target"] = target
 
-        observation_id = (
-            self.latest_detection_scene.get("source_stamp_sec"),
-            self.latest_detection_scene.get("source_stamp_nanosec"),
-        )
-        if not current_target_valid:
-            observation_id = self.servo_target_observation_id
-        servo_state = self.visual_servo.step_from_target(
-            target,
-            self.robot_pose,
-            observation_id=observation_id,
-        )
+        if close_range_locked:
+            self.visual_servo.stop(reset_stability=False)
+            if self.visual_servo.stable_frames < self.config.servo_stable_frames:
+                self.visual_servo.stable_frames += 1
+            servo_state = (
+                ServoState.ALIGNED
+                if (
+                    self.visual_servo.stable_frames
+                    >= self.config.servo_stable_frames
+                )
+                else ServoState.STABILIZING
+            )
+        else:
+            observation_id = (
+                self.latest_detection_scene.get("observation_seq"),
+            )
+            if not current_target_valid:
+                observation_id = self.servo_target_observation_id
+            servo_state = self.visual_servo.step_from_target(
+                target,
+                self.robot_pose,
+                observation_id=observation_id,
+            )
 
         if servo_state == ServoState.REOBSERVE:
             self.publish_ready(False, "target_not_fully_visible_reobserve")
@@ -1145,7 +1544,10 @@ class ActionNavigationNode(Node):
             return
 
         if servo_state != ServoState.ALIGNED:
-            self.publish_ready(False, f"visual_servo_{servo_state}")
+            reason = f"visual_servo_{servo_state}"
+            if close_range_locked:
+                reason = f"visual_servo_close_range_locked_{servo_state}"
+            self.publish_ready(False, reason)
 
             elapsed = time.monotonic() - self.phase_start_time
             if elapsed > self.config.visual_servo_timeout_sec:
@@ -1238,57 +1640,108 @@ class ActionNavigationNode(Node):
         self.navigator.stop()
         self.cmd_vel_pub.publish(Twist())
 
+        close_range_locked = False
+        target = None
+        allow_close_lock_pregrasp = bool(
+            getattr(
+                self.config,
+                "close_range_lock_allow_pregrasp_without_detection",
+                True,
+            )
+        )
+
         if self.latest_detection_scene is None:
+            target = self.close_range_lock_target()
+            if target is None or not allow_close_lock_pregrasp:
                 self.publish_ready(False, "pregrasp_waiting_detection")
                 return
+            close_range_locked = True
+            self.active_task = dict(
+                self.active_task
+                or get_active_task(self.latest_scene or {})
+                or {}
+            )
+            self.active_task["target"] = target
 
-        scene_age = time.monotonic() - self.latest_detection_time
-        if scene_age > self.config.servo_scene_max_age_sec:
-                self.publish_ready(False, "pregrasp_detection_too_old")
-                self.observe_resume = True
-                self.set_phase(Phase.SCAN_AND_REOBSERVE)
-                return
+        if not close_range_locked:
+            scene_age = time.monotonic() - self.latest_detection_time
+            if scene_age > self.config.servo_scene_max_age_sec:
+                target = self.close_range_lock_target()
+                if target is None or not allow_close_lock_pregrasp:
+                    self.publish_ready(False, "pregrasp_detection_too_old")
+                    self.observe_resume = True
+                    self.set_phase(Phase.SCAN_AND_REOBSERVE)
+                    return
+                close_range_locked = True
+                self.active_task = dict(
+                    self.active_task
+                    or get_active_task(self.latest_scene or {})
+                    or {}
+                )
+                self.active_task["target"] = target
 
-        base_task = self.active_task or get_active_task(
+        if not close_range_locked:
+            base_task = self.active_task or get_active_task(
                 self.latest_scene
             )
-        self.active_task = bind_task_target_from_objects(
+            self.active_task = bind_task_target_from_objects(
                 self.latest_detection_scene,
                 base_task,
             )
-        target = (self.active_task or {}).get("target") or {}
+            target = (self.active_task or {}).get("target") or {}
 
-        if not (
+            if not (
                 target_is_detected(self.active_task)
                 and self.target_pose_valid_for_surface(target)
             ):
-                self.pregrasp_lost_frames += 1
-                self.publish_ready(False, "pregrasp_target_lost")
-                if self.pregrasp_lost_frames >= self.config.pregrasp_lost_max_frames:
-                    self.observe_resume = True
-                    self.set_phase(Phase.SCAN_AND_REOBSERVE)
+                locked_target = self.close_range_lock_target(target)
+                if (
+                    locked_target is not None
+                    and allow_close_lock_pregrasp
+                ):
+                    close_range_locked = True
+                    target = locked_target
+                    self.active_task = dict(base_task or {})
+                    self.active_task["target"] = target
+                else:
+                    self.pregrasp_lost_frames += 1
+                    self.publish_ready(False, "pregrasp_target_lost")
+                    if self.pregrasp_lost_frames >= self.config.pregrasp_lost_max_frames:
+                        self.observe_resume = True
+                        self.set_phase(Phase.SCAN_AND_REOBSERVE)
 
-                return
+                    return
         self.pregrasp_lost_frames = 0
+        target = self.restore_motion_metadata(target)
         target = self.apply_pregrasp_metadata(target)
+        if close_range_locked:
+            target["close_range_locked"] = True
         self.active_task = dict(self.active_task or {})
         self.active_task["target"] = target
 
         centroid_uv = target.get("centroid_uv") or []
         box_xyxy = target.get("box_xyxy") or []
 
+        target_u = float(self.config.pregrasp_target_u)
+        target_v = float(self.config.pregrasp_target_v)
+
         if len(centroid_uv) < 2 or len(box_xyxy) < 4:
+            if close_range_locked and allow_close_lock_pregrasp:
+                u = target_u
+                v = target_v
+                x1 = 0.0
+                y1 = 0.0
+                x2 = float(self.config.image_width)
+                y2 = float(self.config.image_height)
+            else:
                 self.publish_ready(False, "pregrasp_target_no_uv")
                 self.observe_resume = True
                 self.set_phase(Phase.SCAN_AND_REOBSERVE)
                 return
-
-        u = float(centroid_uv[0])
-        v = float(centroid_uv[1])
-        x1, y1, x2, y2 = [float(value) for value in box_xyxy]
-
-        target_u = float(self.config.pregrasp_target_u)
-        target_v = float(self.config.pregrasp_target_v)
+        else:
+            u = float(centroid_uv[0])
+            v = float(centroid_uv[1])
+            x1, y1, x2, y2 = [float(value) for value in box_xyxy]
 
         pregrasp_margin_px = 30.0
         pregrasp_bottom_margin_px = 25.0
@@ -1320,6 +1773,8 @@ class ActionNavigationNode(Node):
             and box_size_reasonable
             and uv_safe
         )
+        if close_range_locked and allow_close_lock_pregrasp:
+            pregrasp_view_ready = True
 
         expected_spine = self.pregrasp_target_spine
         if expected_spine is None:
@@ -1414,9 +1869,12 @@ class ActionNavigationNode(Node):
             self.ready_task_id = self.active_task.get("task_id")
             self.ready_target_snapshot = dict(target)
             self.set_phase(Phase.READY_FOR_GRASP)
+            reason = "pregrasp_head_spine_adjusted_target_visible"
+            if close_range_locked:
+                reason = "pregrasp_close_range_locked_ready"
             self.publish_ready(
                 True,
-                "pregrasp_head_spine_adjusted_target_visible",
+                reason,
             )
             return
 
@@ -1437,6 +1895,19 @@ class ActionNavigationNode(Node):
 
     def handle_ready_for_grasp(self):
         self.navigator.stop()
+        self.cmd_vel_pub.publish(Twist())
+
+        if self.grasp_handoff_active:
+            self.visual_servo.stop(reset_stability=False)
+            if self.active_task is None:
+                self.active_task = {}
+            else:
+                self.active_task = dict(self.active_task)
+            self.active_task["target"] = dict(
+                self.ready_target_snapshot or {}
+            )
+            self.publish_ready(True, "grasp_handoff_active_ready_kept")
+            return
 
         current_task = get_active_task(self.latest_scene or {})
         current_task_id = (

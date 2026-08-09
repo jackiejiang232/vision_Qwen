@@ -1,0 +1,203 @@
+{
+  "schema_version": 2,
+  "confirmed": false,
+  "confirmation_required": "每个 profile 都必须经单动作人工观察确认。工具 RPY 决定夹爪以什么姿态压住箱体，不能猜测。",
+  "profiles": {
+    "table_side_hug": {
+      "confirmed": false,
+      "candidate_source": {
+        "kind": "official_fixed_scene_baseline",
+        "image_digest": "sha256:5d525c90169bdf373f112f876ab2e7e45790291ac89f436a221f8b9020c59ed4",
+        "status": "official_baseline_pose_verified_v3",
+        "tool_rpy_correction": {
+          "why": "当前为 0，即完全沿用官方原始抓取姿态。2026-07-31 项目决定：放弃『把指垫外侧平行面掰到与箱面严格平行』的路线。官方方法本就不靠面接触——合拢终点是 s=6 的 hold_half=0.115（不是 grip_half=0.13，后者只在 s=4 用来算张开位），2026-08-01 实测指垫几何压入箱面 左 38.13 mm / 右 38.96 mm，靠指垫压紧的摩擦力持箱，因此 1.03°/2.45° 的偏斜在这个压入量面前是次要量级。",
+          "solver": "dev/tune_tool_rpy.py（保留，作为需要时重新求偏置的手段）",
+          "left_rpy_offset": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "right_rpy_offset": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "reproduce": "python3 dev/motion_lab.py plan PREGRASP --live-fixed-pink   （偏置默认即 0 0 0）",
+          "superseded_correction": {
+            "date": "2026-07-29",
+            "left_rpy_offset": [
+              -0.042092945,
+              -0.0203090839,
+              0.0004296828
+            ],
+            "right_rpy_offset": [
+              0.0422691235,
+              -0.0203099273,
+              -0.0004279434
+            ],
+            "note": "这轮校正本身是有效的（实测面内残差从 1.03° 降到 ≤0.115°），只是路线被放弃。要复现：把上面两组数用 --left-rpy-offset / --right-rpy-offset 显式传给 plan PREGRASP。"
+          }
+        }
+      },
+      "calibration_checks": {
+        "operation_standoff": true,
+        "left_tool_rpy": true,
+        "right_tool_rpy": true,
+        "pregrasp_clearance": true,
+        "synchronized_contact": false,
+        "stable_hold": false
+      },
+      "evidence": [
+        {
+          "check": "pregrasp_clearance / contact_clearance / left_tool_rpy / right_tool_rpy",
+          "date": "2026-07-31",
+          "result": "pass",
+          "runs": [
+            "logs/motion_lab/20260731T140403.277425Z-dock-execute",
+            "logs/motion_lab/20260731T141109.083628Z-pregrasp-execute"
+          ],
+          "record": "logs/motion_lab/contact_clearance_calibration_v3.txt",
+          "tool": "dev/measure_pad_clearance.py",
+          "summary": "官方原始姿态 + 新站位 0.596 下的复测，兑现了 v1 那条 pending。实测 contact 0.033510 m / pregrasp 0.076490 m，与配置现值（v1 在旧站位 0.540 量的 0.033840 / 0.076160）相差 0.330 mm。配置值在两个方向上都更保守，因此本轮的处理是验证已有值仍然成立、不改数值，只把三条 calibration_checks 翻成 true。",
+          "why_standoff_change_did_not_move_it": "站位后退 56 mm，间隙只变 0.330 mm——因为 IK 末端目标是相对箱体定义的（目标半宽 0.230 − 箱体半宽 0.120 = 可分配余量 0.110），底盘退多远手臂就多伸多远，指垫相对箱面的落点与站位解耦。站位管的是立柱净空与 IK 可达性，不管这两个值。实用推论：以后再动 operation_standoff 不必重测本组值；但动 IK 目标半宽或工具姿态则必须重测。",
+          "cross_check": "两条互不依赖的路径给出同一个法向残差 2.68°：(A) 本轮实测扣掉底盘偏航残差 2.084° 后，面内 1.021°、面外 2.480°，合成 2.682°；(B) dev/tune_tool_rpy.py --slide-lift 0.02 在标称停靠位（零 DOCK 残差、零跟踪残差、固定 IK 种子）迭代轮次 0 报左 2.6777°、右 2.6868°。这同时验证了『扣底盘残差』这步做对了，以及该残差是工具坐标系的固有属性，不随站位、升降、停靠误差改变。",
+          "why_tool_rpy_now_passes": "配置里的 left/right_tool_rpy 经在容器内计算 OFFICIAL_*_ROTATION × _rpy_matrix(0,0,0) 逐位确认，就是官方原始姿态本身，不含任何自定义偏置。该姿态下的 2.68° 法向残差已由 v3 实测，并按 2026-07-31 的路线决定被接受（38 mm 量级的压入量面前，2.28 mm 的一头翘是次要量级）。值有官方来源、有实测量化、有接受理由，故这两条 check 成立。",
+          "numeric_trap": "left_tool_rpy 的后两位 -0.0421340455 / -0.0203220335 与已放弃的 v2 偏置 -0.042092945 / -0.0203090839 只差 4e-5，极易误判为『配置里残留着被放弃的校正偏置』。v2 校正姿态的实际值是 [-1.5707014891, -0.0425700564, 4.48e-06]，特征是 roll ≈ ∓π/2 且 yaw ≈ 0，一眼可辨。",
+          "path_divergence_warning": "plan PREGRASP --live-fixed-pink 不读配置里的 left/right_tool_rpy——它用 OFFICIAL_*_ROTATION 乘 CLI 的 --left/right-rpy-offset（默认 0），再把结果写进 plan.json 的 target 作为输出。配置那两个字段供 profile 驱动的正式流程使用（dev/motion_lab.py:486）。两条路径当前一致，改动任一处必须同步另一处。",
+          "not_resolved": "两侧不对称量 0.50 mm 仍不为零，来源是 DOCK 停靠残差（本轮位置 25.2 mm、偏航 2.084°，偏航只剩 9% 验收余量）加手臂跟踪残差 0.00268 rad。与工具姿态无关（v2 把姿态掰到 0.115° 时该值仍有 0.27 mm），synchronized_contact 只能靠接触检测解决。"
+        },
+        {
+          "check": "operation_standoff",
+          "date": "2026-07-30",
+          "result": "pass",
+          "record": "logs/motion_lab/column_table_clearance.txt",
+          "tool": "dev/measure_station_clearance.py",
+          "summary": "官方 client_task_1.py 用的 0.54 会让躯干立柱真插进桌面板：在官方站位 (-1.00, 1.66) 加官方升降 0.48764 下，slide_link/geom#39 与 material_table_top 三轴同时重叠（y +15.84 mm、z +15.64 mm）。不是净空偏小，是真重叠。改为 0.596 后标称站位净空 40.16 mm。",
+          "method": "净空对站位是严格 1:1 线性（实测斜率 1.000 mm/mm，净空 ≈ (standoff−0.5558)×1000 mm）。取值是推出来的：10 mm 规则临界站位 0.5660 + DOCK 位置验收门槛 0.0300 = 0.5960，于是只要 DOCK 通过验收、无论偏向哪一侧，立柱净空都 ≥ 10 mm。",
+          "reach_headroom": "后撤不花钱：PREGRASP 深度（目标半宽 0.230）与 GRASP 贴合深度（0.152434，手臂要再往前伸 77.57 mm）在 standoff 0.540~0.680 全程 IK 有解、位置误差 0.0000 mm、零关节越限；到 0.900 才无解。该指标有鉴别力，不是恒真。",
+          "why_earlier_reading_was_wrong": "前一轮记录的 8.1~9.7 mm 是在真机实际停靠位上量的，那两次 DOCK 都欠停 25.2 mm，等于站位已经后撤到 0.565。折回标称站位就是 -16.0 mm，与直接量到的 -15.64 mm 一致。该条 warning 由本条证据取代。",
+          "caveat": "官方导航容差 nav_pos_tol 0.06 / dynamic_pick_nav_tol 0.05 比本仓库的 0.03 更松；若改回官方容差，standoff 需重算为 0.5660 + 0.060 = 0.6260。"
+        },
+        {
+          "check": "抓取方法路线决定",
+          "date": "2026-07-31",
+          "result": "decision",
+          "summary": "放弃『把夹爪指垫外侧平行面掰到与箱面严格平行』这条路线，回到官方原始抓取姿态（工具 RPY 偏置全部为 0）。理由：官方方法根本不靠面贴合——合拢终点是 s=6 调用的 hold_half=0.115，比箱体半宽 0.120 还小 5 mm，目标点本就在箱体内部，靠的是指垫压紧后的摩擦力。2026-08-01 在容器内用 dev/measure_contact_onset.py 实测：指垫在半宽 153.130 mm（左）/153.960 mm（右）首次接触，合到 115 mm 时几何压入量为 左 38.13 mm / 右 38.96 mm。在 38 mm 量级的压入量面前，1.03°（面内）/2.45°（面外）的法向偏斜折到 127.7 mm 长边上只有 2.35 mm，不构成『接触落在棱上』的实际风险，而为了掰正它引入的两个自定义偏置却让整条链路偏离了官方可复现基线。",
+          "correction_2026_08_01": "本条 2026-07-31 原文把 grip_half=0.13 当成合拢终点、据此算出『压入约 22.4 mm』，这个数是错的。grip_half 只在官方 s=4 用来算张开位（grip_half + OPEN_MARGIN = 0.23），合拢终点是 s=6 的 self.hold_half()（pink 任务表 0.115）。两者差 15 mm，直接决定压入量是 23 mm 还是 38 mm。路线决定本身不受影响——实测压入量比原估计更大，『不靠面贴合』这个理由只会更成立。",
+          "kept": "2026-07-29 那轮测量本身没有作废，它给出了两条仍然有效的事实：(1) 指垫贴合面尺寸 30.2×127.7 mm、官方姿态下的法向偏斜量级；(2) 左右不同时接触的主因是 DOCK 停靠残差与手臂跟踪残差，不是工具坐标系——这条直接决定了 synchronized_contact 要靠接触检测解决。",
+          "reversible": "求解器 dev/tune_tool_rpy.py 保留。要复现被放弃的那轮，把 candidate_source.tool_rpy_correction.superseded_correction 里的两组偏置用 --left-rpy-offset / --right-rpy-offset 显式传给 plan PREGRASP 即可；配置里的 left_tool_rpy / right_tool_rpy 就会变回 v2 的值。",
+          "supersedes": [
+            "left_tool_rpy / right_tool_rpy（2026-07-29）",
+            "pregrasp_clearance（2026-07-29，v2）"
+          ]
+        },
+        {
+          "check": "left_tool_rpy / right_tool_rpy",
+          "date": "2026-07-29",
+          "result": "superseded",
+          "runs": [
+            "logs/motion_lab/20260729T140222.590166Z-dock-execute",
+            "logs/motion_lab/20260729T140821.977217Z-pregrasp-execute"
+          ],
+          "record": "logs/motion_lab/contact_clearance_calibration_v2.txt",
+          "tool": "dev/tune_tool_rpy.py",
+          "summary": "指垫贴合面（30.2×127.7 mm）法向与拥抱轴的夹角，扣掉本次停靠 +2.067° 的底盘偏航残差后：面内 ≤0.115°、面外 ≤0.028°，折到 127.7 mm 长边上是 0.26 mm 的一头翘。校正前（即官方原始姿态）是面内 1.03°、面外 2.45°、一头翘 2.35 mm。",
+          "method": "不推公式，用闭环迭代：求一次官方 IK → 把解摆进只读 MuJoCo → 量出贴合面法向 → 算出把该法向掰到拥抱轴所需的最小旋转并左乘回去 → 重来。每轮的法向都是从官方模型量出来的，脚本自己就是自己的验证。两轮收敛到 0.0000°。",
+          "cross_check": "夹爪开度 0→1 扫描时，指垫外缘到箱面的距离变化从校正前的 +1.648 mm 降到 -0.061 mm。贴合面真的与箱面平行时，张开夹爪只是让指垫在平行于箱面的平面内滑开，距离本就不该变——这是与角度测量互相独立的旁证。",
+          "residual": "剩下的 0.115° 不是系统性偏置：本次手臂跟踪残差 0.00225 rad = 0.129°，与之同量级且方向随机。",
+          "superseded_by": "抓取方法路线决定（2026-07-31）",
+          "why_superseded": "测量结论正确，但它服务的路线被放弃了。配置里现在写的是官方原始姿态，因此这条不再是 left_tool_rpy 的通过依据。2026-07-31 更新：官方姿态下在站位 0.596 的 v3 复测已完成（logs/motion_lab/contact_clearance_calibration_v3.txt），left_tool_rpy / right_tool_rpy 的通过依据现在是那一条，本条继续仅作对照保留。"
+        },
+        {
+          "check": "pregrasp_clearance",
+          "date": "2026-07-29",
+          "result": "measured",
+          "runs": [
+            "logs/motion_lab/20260729T140222.590166Z-dock-execute",
+            "logs/motion_lab/20260729T140821.977217Z-pregrasp-execute"
+          ],
+          "record": "logs/motion_lab/contact_clearance_calibration.txt",
+          "tool": "dev/measure_pad_clearance.py",
+          "summary": "官方原始姿态下实测四片指垫到 box_pink 的间隙，取先贴到的一侧：官方基线的 0.110 m 余量（IK 目标半宽 0.23 − 箱体半宽 0.12）拆成夹爪自身几何 0.033840 m 与空气间隙 0.076160 m。写进配置的就是这一组——因为配置里的工具姿态已经回到官方原始姿态，必须用同一姿态下量到的几何值。",
+          "method": "把箱体横向平移 +10 mm 做对照：左间隙 +10.000 mm、右 −10.000 mm，证明这条方向纯横向且 1:1，因此可由一次实测外推贴合位置，不必把手臂开进箱体去试。",
+          "caveat": "官方姿态下指垫是斜的，突出最多的是一个角而不是整个面，所以这组数比校正姿态下的 0.032434 / 0.077566 大约 1.4 mm。contact_clearance 越大 → IK 目标半宽越大 → 指垫停得离箱面越远，属于安全方向，因此可以先按这组值走。",
+          "pending_resolved": "原文：『这两轮是在旧站位（standoff 0.540）下量的。站位已改为 0.596，需要在官方姿态 + 新站位下复测一次，产出 logs/motion_lab/contact_clearance_calibration_v3.txt；在此之前 calibration_checks.pregrasp_clearance 保持 false。』——已于 2026-07-31 兑现：v3 复测完成，实测值与本条相差 0.330 mm，本条给出的配置值经确认更保守而予以保留，pregrasp_clearance 已翻成 true。"
+        },
+        {
+          "check": "contact_clearance",
+          "date": "2026-07-29",
+          "result": "measured",
+          "record": "logs/motion_lab/contact_clearance_calibration.txt",
+          "summary": "官方原始姿态、夹爪全开、先贴到的一侧取 0.033840 m。（校正姿态下的对应值 0.032434 m 已随路线一并放弃，仅作为对照保留在 v2 记录里。）",
+          "caveat": "这是「指垫刚好贴住箱面、零压入」的几何值，只服务于 PREGRASP（张开位）。刻意的夹紧量不属于本字段：它由 APPROACH 阶段的 hold_half=0.115 唯一决定，2026-08-01 实测压入 左 38.13 mm / 右 38.96 mm，见 logs/motion_lab/contact_onset_scan.txt。",
+          "correction_2026_08_01": "本条原文写『官方基线 grip_half=0.13 相当于压入箱面 22.4 mm』，把 grip_half 误当成了合拢终点。grip_half 只在官方 s=4 用来算张开位（grip_half + OPEN_MARGIN = 0.23），合拢终点是 s=6 的 hold_half=0.115。"
+        },
+        {
+          "check": "两侧不对称",
+          "date": "2026-07-29",
+          "result": "note",
+          "summary": "左右指垫到箱面的间隙差：官方原始姿态 0.67 mm，校正姿态 0.27 mm。两者都不为零，说明剩余来源不在工具坐标系，而是 DOCK 的停靠残差（位置 25.3 mm、偏航 2.07°）加手臂跟踪残差（0.00225 rad）。合拢时两侧仍不会严格同时接触，先碰的一侧会把箱体推歪——这是 synchronized_contact 尚未通过的直接原因，要靠接触检测而不是靠标定来解决。这条结论与抓取姿态路线无关，因此不随 2026-07-31 的决定作废。"
+        },
+        {
+          "check": "躯干立柱与桌面净空",
+          "date": "2026-07-29",
+          "result": "superseded",
+          "summary": "在官方停靠位，slide_link 到 material_table_top 的最小净空只有 8.1~9.7 mm，低于本项目要求的 10 mm；规划器因此必须把躯干从官方升降高度再抬 20 mm 才能通过轨迹碰撞检查。抬升 0~15 mm 区间净空恒为 8.12 mm（该段最近的是横向距离，抬高没用），20 mm 起才开始增大。",
+          "caveat": "净空对底盘位置极其敏感：底盘每往桌子靠近 1 mm，净空约减少 0.92 mm。本轮两次实测底盘 y 相差 1.6 mm，净空就从 9.69 mm 变成 8.12 mm，10 mm 判定直接翻转。进入阶段 5 前需要决定：是把 operation_standoff 从 0.54 往后放几毫米，还是接受这条净空由抬升来保证。",
+          "superseded_by": "operation_standoff（2026-07-30）",
+          "correction": "本条把 8.1~9.7 mm 当成了标称站位的净空，实际那是 DOCK 欠停 25.2 mm 后的读数；标称站位是插入 15.64 mm。另外本条说的『抬升 20 mm 起才增大』也只在欠停位成立。"
+        }
+      ],
+      "approach_direction": [
+        0.0,
+        1.0
+      ],
+      "operation_standoff": 0.596,
+      "primary_contact": "arm_link6 side face",
+      "finger_role": "open anti-rotation support",
+      "contact_press": 0.025,
+      "pregrasp_gap": 0.076,
+      "contact_longitudinal_offset": -0.04,
+      "contact_height_offset": 0.01,
+      "gripper_opening": 1.0
+    },
+    "shelf_extract_hug": {
+      "confirmed": false,
+      "calibration_checks": {
+        "operation_standoff": false,
+        "left_tool_rpy": false,
+        "right_tool_rpy": false,
+        "pregrasp_clearance": false,
+        "synchronized_contact": false,
+        "stable_hold": false
+      },
+      "evidence": [],
+      "approach_direction": null,
+      "operation_standoff": null,
+      "contact_press": null,
+      "pregrasp_gap": null,
+      "contact_longitudinal_offset": null,
+      "contact_height_offset": null,
+      "gripper_opening": null
+    },
+    "table_top_hug": {
+      "confirmed": false,
+      "calibration_checks": {
+        "operation_standoff": false,
+        "left_tool_rpy": false,
+        "right_tool_rpy": false,
+        "pregrasp_clearance": false,
+        "synchronized_contact": false,
+        "stable_hold": false
+      },
+      "evidence": [],
+      "approach_direction": null,
+      "operation_standoff": null,
+      "contact_press": null,
+      "pregrasp_gap": null,
+      "contact_longitudinal_offset": null,
+      "contact_height_offset": null,
+      "gripper_opening": null
+    }
+  }
+}

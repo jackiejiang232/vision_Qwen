@@ -116,11 +116,45 @@ class VisualServo:
             )
         return float(self.config.image_center_u)
 
+    def _is_table_dual_target(self, target):
+        return (
+            self._is_table_target(target)
+            and target.get("selected_arm") == "dual"
+        )
+
+    def _table_linear_speed(self, distance_error):
+        tolerance = float(self.config.servo_depth_tolerance)
+        close_extra = float(
+            getattr(self.config, "servo_table_close_extra_tolerance", 0.03)
+        )
+
+        if distance_error > tolerance:
+            return clamp(
+                float(getattr(self.config, "servo_table_linear_gain", 0.22))
+                * distance_error,
+                0.0,
+                float(getattr(self.config, "servo_table_max_linear_speed", 0.055)),
+            )
+
+        if distance_error < -(tolerance + close_extra):
+            return clamp(
+                float(getattr(self.config, "servo_table_linear_gain", 0.22))
+                * distance_error,
+                -0.025,
+                0.0,
+            )
+
+        return 0.0
+
     def ready_now(self, target, robot_pose):
         centroid_uv = target.get("centroid_uv")
         if not centroid_uv or len(centroid_uv) < 2:
             return False
-        if not self._box_is_usable(target.get("box_xyxy"), target):
+        box_xyxy = target.get("box_xyxy")
+        if self._is_table_dual_target(target):
+            if not self._box_has_signal(box_xyxy):
+                return False
+        elif not self._box_is_usable(box_xyxy, target):
             return False
 
         u = float(centroid_uv[0])
@@ -131,7 +165,12 @@ class VisualServo:
         )
         if abs(u - self._target_u(target)) > self.config.servo_u_tolerance:
             return False
-        if abs(v - target_v) > v_tolerance:
+        # 桌边双臂抓取的底盘伺服只负责横向和距离；垂直视角由
+        # pregrasp_adjust 里的头部/腰部闭环处理，避免在这里卡住不降腰。
+        if (
+            not self._is_table_dual_target(target)
+            and abs(v - target_v) > v_tolerance
+        ):
             return False
 
         distance = self._planar_distance(target, robot_pose)
@@ -164,13 +203,25 @@ class VisualServo:
             self.config,
         )
 
+        table_dual = self._is_table_dual_target(target)
+        distance = self._planar_distance(target, robot_pose)
+        desired_distance = self._desired_distance(target)
+        distance_error = (
+            None
+            if distance is None
+            else distance - desired_distance
+        )
+
         # 目标已经出现在画面边缘时，不要退回观察状态。
-        # 直接用小速度把底盘退出/靠近，让目标重新回到可伺服区域。
+        # 桌边双臂抓取时，是否后退要由世界距离决定，避免画面裁切和距离闭环打架。
         if v > self.config.servo_max_v:
             self.reset()
-            msg.linear.x = (
-                -0.05 if self._is_table_target(target) else 0.0
-            )
+            if table_dual and distance_error is not None:
+                msg.linear.x = min(0.0, self._table_linear_speed(distance_error))
+            else:
+                msg.linear.x = (
+                    -0.05 if self._is_table_target(target) else 0.0
+                )
             msg.angular.z = clamp(
                 -0.0008 * u_error,
                 -0.05,
@@ -181,7 +232,10 @@ class VisualServo:
 
         if v < self.config.servo_min_v:
             self.reset()
-            msg.linear.x = 0.04
+            if table_dual and distance_error is not None:
+                msg.linear.x = max(0.0, self._table_linear_speed(distance_error))
+            else:
+                msg.linear.x = 0.04
             msg.angular.z = clamp(
                 -0.0008 * u_error,
                 -0.05,
@@ -190,15 +244,20 @@ class VisualServo:
             self.publisher.publish(msg)
             return ServoState.MOVING
 
-        if abs(v - target_v) > v_tolerance:
+        # 桌边双臂抓取接近后，目标常会落在画面偏下位置。
+        # 这里不再用普通 v 误差阻塞 ALIGNED，后续 pregrasp_adjust 会调头和腰。
+        if abs(v - target_v) > v_tolerance and not table_dual:
             if self._is_table_target(target):
                 self.reset()
                 v_error = v - target_v
-                msg.linear.x = clamp(
-                    -0.0012 * v_error,
-                    -0.06,
-                    0.05,
-                )
+                if table_dual and distance_error is not None:
+                    msg.linear.x = self._table_linear_speed(distance_error)
+                else:
+                    msg.linear.x = clamp(
+                        -0.0012 * v_error,
+                        -0.06,
+                        0.05,
+                    )
                 msg.angular.z = clamp(
                     -0.0010 * u_error,
                     -0.06,
@@ -210,32 +269,45 @@ class VisualServo:
             self.stop()
             return ServoState.REOBSERVE
 
-        distance = self._planar_distance(target, robot_pose)
-        if distance is None:
+        if distance is None or distance_error is None:
             self.stop()
             return ServoState.REOBSERVE
 
-        distance_error = distance - self._desired_distance(target)
-
         if not box_is_usable:
-            self.reset()
-            msg.angular.z = clamp(
-                -0.0012 * u_error,
-                -self.config.servo_max_angular_speed,
-                self.config.servo_max_angular_speed,
-            )
-            if abs(u_error) <= self.config.servo_u_tolerance:
-                msg.linear.x = -0.04
-            self.publisher.publish(msg)
-            return ServoState.MOVING
+            if table_dual:
+                linear_speed = self._table_linear_speed(distance_error)
+                if (
+                    abs(linear_speed) <= 1e-6
+                    and abs(u_error) <= self.config.servo_u_tolerance
+                ):
+                    box_is_usable = True
+                else:
+                    self.reset()
+                    msg.angular.z = clamp(
+                        -0.00035 * u_error,
+                        -0.025,
+                        0.025,
+                    )
+                    if abs(u_error) <= self.config.servo_u_tolerance:
+                        msg.linear.x = linear_speed
+                    self.publisher.publish(msg)
+                    return ServoState.MOVING
+            else:
+                self.reset()
+                msg.angular.z = clamp(
+                    -0.0012 * u_error,
+                    -self.config.servo_max_angular_speed,
+                    self.config.servo_max_angular_speed,
+                )
+                if abs(u_error) <= self.config.servo_u_tolerance:
+                    msg.linear.x = -0.04
+                self.publisher.publish(msg)
+                return ServoState.MOVING
 
         if abs(u_error) > self.config.servo_u_tolerance:
             self.reset()
 
-            if (
-                self._is_table_target(target)
-                and target.get("selected_arm") == "dual"
-            ):
+            if table_dual:
                 msg.angular.z = clamp(
                     -0.00035 * u_error,
                     -0.035,
@@ -251,7 +323,20 @@ class VisualServo:
             self.publisher.publish(msg)
             return ServoState.MOVING
 
-        if abs(distance_error) > self.config.servo_depth_tolerance:
+        if table_dual:
+            linear_speed = self._table_linear_speed(distance_error)
+            if abs(linear_speed) > 1e-6:
+                self.reset()
+                msg.linear.x = linear_speed
+                msg.angular.z = clamp(
+                    -0.00035 * u_error,
+                    -0.025,
+                    0.025,
+                )
+                self.publisher.publish(msg)
+                return ServoState.MOVING
+
+        elif abs(distance_error) > self.config.servo_depth_tolerance:
             self.reset()
             msg.linear.x = clamp(
                 0.45 * distance_error,
@@ -259,10 +344,7 @@ class VisualServo:
                 self.config.servo_max_linear_speed,
             )
 
-            if (
-                self._is_table_target(target)
-                and target.get("selected_arm") == "dual"
-            ):
+            if table_dual:
                 msg.angular.z = clamp(
                     -0.00035 * u_error,
                     -0.025,

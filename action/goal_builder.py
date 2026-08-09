@@ -99,6 +99,12 @@ def build_approach_goal_from_target(
 
     return Pose2D(x=goal_x, y=goal_y, yaw=yaw)
 
+def pose2d_from_motion_handoff(pose):
+    return Pose2D(
+        x=float(pose.x),
+        y=float(pose.y),
+        yaw=float(pose.yaw),
+    )
 
 def build_search_goal(area_name):
     return SEARCH_WAYPOINTS.get(
