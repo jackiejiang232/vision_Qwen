@@ -361,7 +361,9 @@ class SafetyGateway(Node):
                 response.success = False
                 response.message = "请先复位急停"
                 return response
-            stale = self.stale_reason(time.monotonic())
+            # 允许先开启网关、后启动具体动作。导航阶段由导航节点直接
+            # 控制底盘/头腰，抓取开始后才会出现 control_request。
+            stale = self.robot_feedback_stale_reason(time.monotonic())
             if stale is not None:
                 response.success = False
                 response.message = f"数据未就绪：{stale}"
@@ -411,6 +413,15 @@ class SafetyGateway(Node):
                 return f"{label} stale for more than {self.TIMEOUT:.1f}s"
         return None
 
+    def robot_feedback_stale_reason(self, now: float) -> str | None:
+        for label, stamp in (
+            ("joint_states", self.last_joint_state),
+            ("odom", self.last_odom),
+        ):
+            if stamp <= 0.0 or now - stamp > self.TIMEOUT:
+                return f"{label} stale for more than {self.TIMEOUT:.1f}s"
+        return None
+
     def _publish(self, command: ControlCommand) -> None:
         # 底盘是速度量：不发 = 上一条速度继续生效，所以**每周期都必须显式发**，
         # "停"写成显式的 0。四个位置控制器相反：不发 = 设定点不变 = 停在原地，
@@ -432,14 +443,24 @@ class SafetyGateway(Node):
             publishers[name].publish(Float64MultiArray(data=payload))
 
     def _publish_safe(self, now: float) -> None:
-        self.cmd_vel_pub.publish(Twist())
         hold = stopped(self.last_output, now)
         if hold is not None:
             self._publish(hold)
+        elif self.emergency_stop:
+            self.cmd_vel_pub.publish(Twist())
 
     def tick(self) -> None:
         now = time.monotonic()
-        reason = self.stale_reason(now)
+        has_control_stream = (
+            self.last_request is not None
+            or self.last_request_rx > 0.0
+            or self.last_heartbeat > 0.0
+        )
+        reason = (
+            self.stale_reason(now)
+            if has_control_stream
+            else self.robot_feedback_stale_reason(now)
+        )
         if self.auto_enable and not self.enabled and not self.emergency_stop:
             if reason is None:
                 self.enabled = True
@@ -453,8 +474,9 @@ class SafetyGateway(Node):
             self._publish(self.last_output)
             self.control_output_cycles += 1
         else:
-            self._publish_safe(now)
-            self.safe_output_cycles += 1
+            if self.emergency_stop or self.last_output is not None:
+                self._publish_safe(now)
+                self.safe_output_cycles += 1
 
     def publish_runtime(self) -> None:
         now = time.monotonic()

@@ -1,4 +1,9 @@
 from dataclasses import dataclass
+from pathlib import Path
+
+
+_VISION_ROOT = Path(__file__).resolve().parents[1]
+_DG_CONFIG_ROOT = _VISION_ROOT / "third_party" / "dg202612_config"
 
 
 @dataclass(frozen=True)
@@ -21,27 +26,9 @@ class ActionConfig:
     # A* 配置
     enable_motion_astar: bool = True
 
-    # dg_scene_geometry_path: str = (
-    #     "/media/jiangzhenmin/data/Challengecup2026/JZM/Vision/"
-    #     "third_party/dg202612_config/scene_geometry.json"
-    # )
-    # dg_robot_geometry_path: str = (
-    #     "/media/jiangzhenmin/data/Challengecup2026/JZM/Vision/"
-    #     "third_party/dg202612_config/robot_geometry.json"
-    # )
-    # dg_grasp_profiles_path: str = (
-    #     "/media/jiangzhenmin/data/Challengecup2026/JZM/Vision/"
-    #     "third_party/dg202612_config/grasp_profiles.json"
-    # )
-    dg_scene_geometry_path: str = (
-    "/workspace/Vision/third_party/dg202612_config/scene_geometry.json"
-    )
-    dg_robot_geometry_path: str = (
-        "/workspace/Vision/third_party/dg202612_config/robot_geometry.json"
-    )
-    dg_grasp_profiles_path: str = (
-        "/workspace/Vision/third_party/dg202612_config/grasp_profiles.json"
-    )
+    dg_scene_geometry_path: str = str(_DG_CONFIG_ROOT / "scene_geometry.json")
+    dg_robot_geometry_path: str = str(_DG_CONFIG_ROOT / "robot_geometry.json")
+    dg_grasp_profiles_path: str = str(_DG_CONFIG_ROOT / "grasp_profiles.json")
 
     astar_position_tolerance: float = 0.05
     astar_yaw_tolerance: float = 0.07
@@ -60,6 +47,13 @@ class ActionConfig:
 
     goal_xy_tolerance: float = 0.04
     goal_yaw_tolerance: float = 0.06
+
+    # 比赛任务链路的官方初始点。总控回原点优先使用这个固定值，
+    # 避免节点启动晚或旧 odom 把桌前/货架前误记成 home。
+    task_use_fixed_home_pose: bool = True
+    task_home_x: float = -0.70
+    task_home_y: float = 0.55005
+    task_home_yaw: float = 1.5707963267948966 + 0.08
 
     # 先导航到观察/预抓取位姿，不直接贴到物体坐标。
     approach_distance_table: float = 0.55
@@ -102,12 +96,12 @@ class ActionConfig:
     servo_target_u_table_offset_px: float = 0.0
     # 桌面抓取时目标不追求图像正中心，而是保持完整可见并略偏上。
     servo_target_v_table: float = 220.0
-    servo_target_v_shelf: float = 240.0
+    servo_target_v_shelf: float = 310.0
     servo_min_v: float = 120.0
     servo_max_v: float = 390.0
     servo_u_tolerance: float = 25.0
     servo_v_tolerance_table: float = 55.0
-    servo_v_tolerance_shelf: float = 55.0
+    servo_v_tolerance_shelf: float = 95.0
     servo_bbox_margin_px: float = 20.0
     servo_table_bottom_margin_px: float = 42.0
     servo_min_bbox_width_px: float = 35.0
@@ -115,10 +109,13 @@ class ActionConfig:
     servo_edge_min_bbox_width_px: float = 28.0
     servo_edge_min_bbox_height_px: float = 12.0
     servo_target_distance_table: float = 0.52
-    servo_target_distance_shelf: float = 0.76
+    servo_target_distance_shelf: float = 0.62
     servo_depth_tolerance: float = 0.055
     servo_max_linear_speed: float = 0.16
     servo_max_angular_speed: float = 0.12
+    servo_shelf_yaw_tolerance_rad: float = 0.16
+    servo_shelf_yaw_gain: float = 0.55
+    servo_shelf_max_angular_speed: float = 0.16
     servo_table_linear_gain: float = 0.22
     servo_table_max_linear_speed: float = 0.055
     servo_table_close_extra_tolerance: float = 0.025
@@ -152,7 +149,7 @@ class ActionConfig:
     enable_head_observe: bool = True
     enable_spine_observe: bool = True
 
-    table_pick_x_range: tuple = (-1.35, 0.18)
+    table_pick_x_range: tuple = (-1.45, -0.05)
     table_pick_y_range: tuple = (1.42, 1.82)
     table_pregrasp_z0: float = 1.32163718
     table_pregrasp_spine_min: float = -0.04
@@ -161,7 +158,7 @@ class ActionConfig:
     table_pregrasp_head_pitch: float = -0.65
     table_pregrasp_head_tolerance: float = 0.08
     pregrasp_adjust_enable: bool = True
-    pregrasp_adjust_timeout_sec: float = 8.0
+    pregrasp_adjust_timeout_sec: float = 12.0
     pregrasp_adjust_min_sec: float = 2.5
     pregrasp_adjust_stable_frames: int = 5
     pregrasp_lost_max_frames: int = 10
@@ -172,18 +169,18 @@ class ActionConfig:
     pregrasp_spine_max_delta: float = 0.2 #单次最多下降xx m等效量，避免一下子过低丢视野
     
     #如果腰部最后太高，减小 pregrasp_spine_reference_z,如果腰部最后太低，增大 pregrasp_spine_reference_z
-    pregrasp_allow_timeout_ready: bool = False
+    pregrasp_allow_timeout_ready: bool = True
 
     # 腰部每次小步下降，别一次降到底
     pregrasp_spine_step: float = 0.03
 
     # 从视觉伺服结束时的腰部位置继续下降多少。
     # 如果你测试发现方向反了，就把 0.12 改成 -0.12。
-    pregrasp_spine_delta_after_servo: float = 0.35
+    pregrasp_spine_delta_after_servo: float = 0.3
     pregrasp_spine_target_tolerance: float = 0.025
 
     # 头部回正目标。-0.65 比较俯视，-0.30 更回正。
-    pregrasp_final_head_pitch: float = -0.5
+    pregrasp_final_head_pitch: float = -0.55
     pregrasp_head_pitch_tolerance: float = 0.05
 
     # 桌面箱子最终希望仍然正对图像中心，但位置略偏上
@@ -194,8 +191,8 @@ class ActionConfig:
 
     # 头部回正范围：你现在 -0.65 是比较俯视，回正可先试 -0.35
     pregrasp_head_pitch_min: float = -0.70
-    pregrasp_head_pitch_max: float = -0.15
-    pregrasp_head_pitch_step: float = 0.1  #头部俯仰速度
+    pregrasp_head_pitch_max: float = -0.30
+    pregrasp_head_pitch_step: float = 0.03  #头部俯仰速度
     table_grasp_distance_min: float = 0.42
     table_grasp_distance_max: float = 0.60
 
@@ -237,16 +234,16 @@ class ActionConfig:
     )
 
     shelf_observe_sequence: tuple = (
-        ("shelf_center", 0.0, -0.10, 0.0, 1.5),
-        ("shelf_left", 0.25, -0.10, 0.0, 1.5),
-        ("shelf_right", -0.25, -0.10, 0.0, 1.5),
-        ("shelf_lower", 0.0, -0.25, 0.08, 1.5),
-        ("shelf_lower_2", 0.0, -0.35, 0.16, 2.0),
+        ("shelf_center", 0.0, -0.20, 0.10, 1.5),
+        ("shelf_left", 0.25, -0.20, 0.10, 1.5),
+        ("shelf_right", -0.25, -0.20, 0.10, 1.5),
+        ("shelf_lower", 0.0, -0.35, 0.20, 1.5),
+        ("shelf_lower_2", 0.0, -0.45, 0.26, 2.0),
     )
 
     shelf_search_observe_sequence: tuple = (
-        ("shelf_search_center", 0.0, -0.10, 0.0, 1.6),
-        ("shelf_search_lower", 0.0, -0.35, 0.16, 1.6),
+        ("shelf_search_center", 0.0, -0.20, 0.10, 1.6),
+        ("shelf_search_lower", 0.0, -0.42, 0.24, 1.8),
     )
 
     # grasp executor（抓取字段）
@@ -261,6 +258,21 @@ class ActionConfig:
     grasp_max_slide_step: float = 0.004
     grasp_command_topic: str = "/action/grasp_command"
     grasp_status_topic: str = "/action/grasp_status"
+
+    # task finish reset: 回原点后把腰部、头部、双臂和夹爪拉回安全待机姿态
+    reset_slide: float = 0.00606
+    reset_head_yaw: float = 0.05
+    reset_head_pitch: float = 0.0
+    reset_left_arm: tuple = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    reset_right_arm: tuple = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    reset_left_gripper: float = 0.003
+    reset_right_gripper: float = 0.003
+    reset_max_joint_step: float = 0.025
+    reset_max_slide_step: float = 0.004
+    reset_position_tolerance: float = 0.035
+    reset_slide_tolerance: float = 0.025
+    reset_hold_sec: float = 0.30
+    reset_timeout_sec: float = 8.0
 
     # topics
     ready_for_grasp_topic: str = "/action/ready_for_grasp"
@@ -317,5 +329,32 @@ class ActionConfig:
     grasp_lift_delta_m: float = -0.05
     grasp_lift_step_m: float = 0.003
     grasp_retreat_distance_m: float = 0.20
+
+    # task executor（任务级连续执行）
+    task_command_topic: str = "/task/command"
+    official_instruction_topic: str = "/material/instruction"
+    task_status_topic: str = "/task/status"
+    task_pick_goal_topic: str = "/task/pick_goal"
+
+    # generic navigation skill（通用导航接口，仍由 action_navigation_node 执行）
+    navigation_goal_topic: str = "/action/navigation_goal"
+    navigation_status_topic: str = "/action/navigation_status"
+
+    # place skill（放置执行接口）
+    place_command_topic: str = "/action/place_command"
+    place_status_topic: str = "/action/place_status"
+
+    # task-level navigation tolerances
+    task_nav_xy_tolerance: float = 0.06
+    task_nav_yaw_tolerance: float = 0.10
+    task_reference_query_topic: str = "/vlm/dino_query"
+    task_reference_query_period_sec: float = 1.0
+
+    # place planning（货架层空位规划）
+    place_level_edge_margin_m: float = 0.08
+    place_object_clearance_m: float = 0.10
+    place_default_object_length_m: float = 0.22
+    place_default_object_width_m: float = 0.20
+    place_default_object_height_m: float = 0.10
 
 CONFIG = ActionConfig()

@@ -10,7 +10,13 @@ from nav_msgs.msg import Odometry
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64MultiArray, Header, String
 
-from third_party.dg202612.contracts import CameraId, ExecutionPhase, GraspEvidence, RobotTargets
+from third_party.dg202612.contracts import (
+    CameraId,
+    CameraObservation,
+    ExecutionPhase,
+    GraspEvidence,
+    RobotTargets,
+)
 from third_party.dg202612.executor import ExecutorEvent, MinimumPickExecutor
 from third_party.dg202612.navigation import PathPlan
 from third_party.dg202612.ros_adapter import legacy_control_vector
@@ -48,7 +54,11 @@ class GraspExecutorNode(Node):
         self.goal = None
         self.pending_frames = []
         self.current_control_target = None
+        self.reset_target = None
+        self.reset_started_at = 0.0
+        self.reset_stable_since = 0.0
         self.state = "WAIT_READY"
+        self.manual_sim_pick = False
         self.last_ready_log_at = 0.0
         self.last_ready_target = None
         self.last_idle_request_log_at = 0.0
@@ -99,25 +109,127 @@ class GraspExecutorNode(Node):
         if command == "start":
             self.start_grasp()
         elif command == "pregrasp_done":
+            if self.advance_manual_sim_pick("pregrasp_done"):
+                return
             self.advance(ExecutorEvent.PREGRASP_REACHED)
         elif command == "contact_done":
+            if self.advance_manual_sim_pick("contact_done"):
+                return
             self.manual_contact_done()
         elif command == "hold_done":
+            if self.advance_manual_sim_pick("hold_done"):
+                return
             self.manual_hold_done()
         elif command == "lift_done":
+            if self.advance_manual_sim_pick("lift_done"):
+                return
             self.manual_lift_done()
         elif command == "retreat_done":
             self.advance(ExecutorEvent.RETREAT_COMPLETE)
+        elif command in ("reset", "home_reset", "reset_pose"):
+            self.start_reset()
         elif command == "abort":
             self.safe_stop("operator_abort")
         else:
             self.publish_status("unknown_command", command=command)
+
+    def start_reset(self):
+        try:
+            robot = robot_state_from_ros(self.latest_odom, self.latest_joints, self.config)
+        except ValueError as exc:
+            self.state = "WAIT_READY"
+            self.pending_frames = []
+            self.current_control_target = None
+            self.publish_status("reset_waiting_robot_state", reason=str(exc))
+            return
+
+        start = measured_targets(robot)
+        target = RobotTargets(
+            base_linear=0.0,
+            base_angular=0.0,
+            slide=float(self.config.reset_slide),
+            head_yaw=float(self.config.reset_head_yaw),
+            head_pitch=float(self.config.reset_head_pitch),
+            left_arm=tuple(float(value) for value in self.config.reset_left_arm),
+            left_gripper=float(self.config.reset_left_gripper),
+            right_arm=tuple(float(value) for value in self.config.reset_right_arm),
+            right_gripper=float(self.config.reset_right_gripper),
+        )
+        self.pick_executor = None
+        self.pending_frames = self.interpolate_targets(
+            start,
+            target,
+            max_joint_step=float(self.config.reset_max_joint_step),
+            max_slide_step=float(self.config.reset_max_slide_step),
+        )
+        self.current_control_target = start
+        self.reset_target = target
+        self.reset_started_at = time.time()
+        self.reset_stable_since = 0.0
+        self.state = "RESETTING"
+        self.publish_status("reset_started", frames=len(self.pending_frames))
+        if self.config.grasp_dry_run:
+            self.pending_frames = []
+            self.current_control_target = None
+            self.reset_target = None
+            self.state = "WAIT_READY"
+            self.publish_status("reset_done", dry_run=True)
+
+    def interpolate_targets(self, start, target, *, max_joint_step, max_slide_step):
+        joint_values = (
+            list(start.left_arm)
+            + [start.left_gripper]
+            + list(start.right_arm)
+            + [start.right_gripper]
+            + [start.head_yaw, start.head_pitch]
+        )
+        target_values = (
+            list(target.left_arm)
+            + [target.left_gripper]
+            + list(target.right_arm)
+            + [target.right_gripper]
+            + [target.head_yaw, target.head_pitch]
+        )
+        max_joint_delta = max(
+            [abs(after - before) for before, after in zip(joint_values, target_values)]
+            or [0.0]
+        )
+        max_slide_delta = abs(target.slide - start.slide)
+        joint_steps = int(math.ceil(max_joint_delta / max(max_joint_step, 1e-6)))
+        slide_steps = int(math.ceil(max_slide_delta / max(max_slide_step, 1e-6)))
+        count = max(1, joint_steps, slide_steps)
+        frames = []
+        for index in range(1, count + 1):
+            ratio = index / count
+            frames.append(
+                RobotTargets(
+                    base_linear=0.0,
+                    base_angular=0.0,
+                    slide=start.slide + (target.slide - start.slide) * ratio,
+                    head_yaw=start.head_yaw + (target.head_yaw - start.head_yaw) * ratio,
+                    head_pitch=start.head_pitch + (target.head_pitch - start.head_pitch) * ratio,
+                    left_arm=tuple(
+                        before + (after - before) * ratio
+                        for before, after in zip(start.left_arm, target.left_arm)
+                    ),
+                    left_gripper=start.left_gripper
+                    + (target.left_gripper - start.left_gripper) * ratio,
+                    right_arm=tuple(
+                        before + (after - before) * ratio
+                        for before, after in zip(start.right_arm, target.right_arm)
+                    ),
+                    right_gripper=start.right_gripper
+                    + (target.right_gripper - start.right_gripper) * ratio,
+                )
+            )
+        return frames
 
     def start_grasp(self):
         if not self.config.enable_grasp_executor:
             self.publish_status("disabled", hint="set enable_grasp_executor=True")
             return
         self.state = "STARTING"
+        self.manual_sim_pick = False
         self.pick_executor = None
         self.pending_frames = []
         self.current_control_target = None
@@ -130,12 +242,18 @@ class GraspExecutorNode(Node):
             self.publish_status("ready_too_old")
             return
         try:
+            ready_task_id = str(self.latest_ready.get("task_id") or "")
+            ready_profile = self.latest_ready.get("motion_grasp_profile")
+            ready_source = self.latest_ready.get("motion_source_area")
+            if ready_profile is None or ready_source is None:
+                self.start_manual_sim_pick(
+                    task_id=ready_task_id or "unknown",
+                    profile=ready_profile or "manual_sim_missing_motion_metadata",
+                )
+                return
+
             robot = robot_state_from_ros(self.latest_odom, self.latest_joints, self.config)
             self.scene, self.goal = scene_goal_from_ready(self.latest_ready, robot)
-            if self.goal.task_id.value != "task_1":
-                raise ValueError("first version only supports task_1")
-            if self.goal.grasp_profile.value != "table_side_hug":
-                raise ValueError("first version only supports table_side_hug")
 
             target = self.scene.object_by_id(self.goal.target_id)
             if target is None:
@@ -154,6 +272,15 @@ class GraspExecutorNode(Node):
                     "height": target.size.height,
                 },
             )
+            if (
+                self.goal.task_id.value != "task_1"
+                or self.goal.grasp_profile.value != "table_side_hug"
+            ):
+                self.start_manual_sim_pick(
+                    task_id=self.goal.task_id.value,
+                    profile=self.goal.grasp_profile.value,
+                )
+                return
             approach_direction, standoff = self.docked_approach(robot, target)
             planner = AlreadyDockedPlanner()
             solver = make_solver(robot, self.config)
@@ -213,6 +340,72 @@ class GraspExecutorNode(Node):
         except Exception as exc:
             self.safe_stop(str(exc))
 
+    def start_manual_sim_pick(self, *, task_id, profile):
+        self.manual_sim_pick = True
+        self.pick_executor = None
+        self.pending_frames = []
+        self.current_control_target = None
+        self.state = "EXECUTE_PREGRASP"
+        self.publish_status(
+            "manual_sim_pick_started",
+            task_id=task_id,
+            profile=profile,
+            hint=(
+                "real grasp is not implemented for this task/profile; "
+                "use pregrasp_done/contact_done/hold_done/lift_done"
+            ),
+        )
+        self.publish_status("queued", label="manual_sim_pregrasp", frames=0)
+
+    def advance_manual_sim_pick(self, command):
+        if not self.manual_sim_pick:
+            return False
+        if command == "pregrasp_done":
+            if self.state != "EXECUTE_PREGRASP":
+                self.publish_status(
+                    "manual_sim_command_ignored",
+                    command=command,
+                    expected_state="EXECUTE_PREGRASP",
+                )
+                return True
+            self.state = "EXECUTE_APPROACH"
+            self.publish_status("queued", label="manual_sim_approach", frames=0)
+            return True
+        if command == "contact_done":
+            if self.state != "EXECUTE_APPROACH":
+                self.publish_status(
+                    "manual_sim_command_ignored",
+                    command=command,
+                    expected_state="EXECUTE_APPROACH",
+                )
+                return True
+            self.state = "EXECUTE_HOLD"
+            self.publish_status("queued", label="manual_sim_hold", frames=0)
+            return True
+        if command == "hold_done":
+            if self.state != "EXECUTE_HOLD":
+                self.publish_status(
+                    "manual_sim_command_ignored",
+                    command=command,
+                    expected_state="EXECUTE_HOLD",
+                )
+                return True
+            self.state = "EXECUTE_LIFT"
+            self.publish_status("queued", label="manual_sim_lift", frames=0)
+            return True
+        if command == "lift_done":
+            if self.state != "EXECUTE_LIFT":
+                self.publish_status(
+                    "manual_sim_command_ignored",
+                    command=command,
+                    expected_state="EXECUTE_LIFT",
+                )
+                return True
+            self.state = "LIFT_DONE"
+            self.publish_status("lift_done_waiting_retreat", manual_sim=True)
+            return True
+        return False
+
     def docked_approach(self, robot, target):
         dx = target.pose.x - robot.base.x
         dy = target.pose.y - robot.base.y
@@ -268,7 +461,11 @@ class GraspExecutorNode(Node):
     def scene_with_manual_evidence(self, *, contact=False, lifted=False):
         if self.scene is None or self.goal is None:
             raise ValueError("grasp scene is not ready")
-        now = time.time()
+        # Keep manual evidence just behind the validator's ``now`` value.
+        # Otherwise a few milliseconds of call ordering can look like a
+        # "future" robot/camera/evidence timestamp.
+        now = time.time() - 0.05
+        robot = robot_state_from_ros(self.latest_odom, self.latest_joints, self.config, now=now)
         evidence = GraspEvidence(
             target_id=self.goal.target_id,
             observed_at=now,
@@ -279,7 +476,17 @@ class GraspExecutorNode(Node):
             centered_error_m=0.0 if contact else None,
             object_lifted=bool(lifted),
         )
-        return replace(self.scene, timestamp=now, grasp_evidence=evidence)
+        return replace(
+            self.scene,
+            timestamp=now,
+            robot=robot,
+            camera_observations=(
+                CameraObservation(CameraId.HEAD_RGBD, now),
+                CameraObservation(CameraId.LEFT_WRIST_RGB, now),
+                CameraObservation(CameraId.RIGHT_WRIST_RGB, now),
+            ),
+            grasp_evidence=evidence,
+        )
 
     def manual_contact_done(self):
         if self.pick_executor is None:
@@ -436,6 +643,8 @@ class GraspExecutorNode(Node):
             self.publish_status("dry_run_skip_publish", label="lift")
 
     def tick(self):
+        if self.state == "WAIT_READY":
+            return
         header = Header()
         header.stamp = self.get_clock().now().to_msg()
         self.heartbeat_pub.publish(header)
@@ -443,11 +652,57 @@ class GraspExecutorNode(Node):
             return
         if self.pending_frames:
             self.current_control_target = self.pending_frames.pop(0)
+        elif self.state == "RESETTING":
+            self.current_control_target = self.reset_target
+            if self.reset_reached():
+                self.state = "WAIT_READY"
+                self.current_control_target = None
+                self.reset_target = None
+                self.publish_status("reset_done")
+                return
+            if time.time() - self.reset_started_at > float(self.config.reset_timeout_sec):
+                self.publish_status("reset_timeout", hint="check safety gateway is enabled")
+                self.reset_started_at = time.time()
         elif self.current_control_target is None:
             self.current_control_target = self.idle_hold_target()
         if self.current_control_target is None:
             return
         self.publish_control_target(self.current_control_target)
+
+    def reset_reached(self):
+        if self.reset_target is None:
+            return False
+        try:
+            current = measured_targets(
+                robot_state_from_ros(self.latest_odom, self.latest_joints, self.config)
+            )
+        except ValueError:
+            self.reset_stable_since = 0.0
+            return False
+
+        arm_error = max(
+            [abs(before - after) for before, after in zip(current.left_arm, self.reset_target.left_arm)]
+            + [abs(before - after) for before, after in zip(current.right_arm, self.reset_target.right_arm)]
+            + [
+                abs(current.left_gripper - self.reset_target.left_gripper),
+                abs(current.right_gripper - self.reset_target.right_gripper),
+                abs(current.head_yaw - self.reset_target.head_yaw),
+                abs(current.head_pitch - self.reset_target.head_pitch),
+            ]
+        )
+        slide_error = abs(current.slide - self.reset_target.slide)
+        reached = (
+            arm_error <= float(self.config.reset_position_tolerance)
+            and slide_error <= float(self.config.reset_slide_tolerance)
+        )
+        if not reached:
+            self.reset_stable_since = 0.0
+            return False
+        now = time.time()
+        if self.reset_stable_since <= 0.0:
+            self.reset_stable_since = now
+            return False
+        return now - self.reset_stable_since >= float(self.config.reset_hold_sec)
 
     def idle_hold_target(self):
         try:

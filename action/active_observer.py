@@ -42,6 +42,8 @@ class ActiveObserver:
         self.current_surface = None
         self.current_mode = None
         self.last_commanded_spine = None
+        self.last_command = None
+        self.last_command_time = 0.0
 
     def expected_table_spine(self, target):
         pose = (target or {}).get("pose_world") or {}
@@ -159,6 +161,20 @@ class ActiveObserver:
         head_pitch,
         spine,
     ):
+        now = time.monotonic()
+        command = (
+            round(float(head_yaw), 4),
+            round(float(head_pitch), 4),
+            round(float(spine), 4),
+        )
+        if (
+            command == self.last_command
+            and now - self.last_command_time < 0.5
+        ):
+            return
+        self.last_command = command
+        self.last_command_time = now
+
         if self.config.enable_head_observe:
             head_msg = Float64MultiArray()
             head_msg.data = [

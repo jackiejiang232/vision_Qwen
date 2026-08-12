@@ -29,7 +29,7 @@ from .scene_reader import (
     target_is_detected,
     target_is_visible_for_servo,
 )
-from .simple_nav import SimpleCmdVelNavigator
+from .simple_nav import SimpleCmdVelNavigator, normalize_angle
 from .target_lock import SearchTargetLock
 from .visual_servo import ServoState, VisualServo
 
@@ -45,6 +45,7 @@ class Phase:
     VISUAL_SERVO = "visual_servo"
     PREGRASP_ADJUST = "pregrasp_adjust"
     READY_FOR_GRASP = "ready_for_grasp"
+    EXTERNAL_NAVIGATE = "external_navigate"
     SAFE_STOP = "safe_stop"
 
 
@@ -90,6 +91,11 @@ class ActionNavigationNode(Node):
         self.current_motion_metadata = {}
         self.motion_task_metadata = {}
         self.grasp_handoff_active = False
+        self.grasp_failure_hold = False
+        self.latest_pick_goal = None
+        self.latest_pick_goal_time = 0.0
+        self.latest_task_status = None
+        self.latest_task_status_time = 0.0
 
         self.cmd_vel_pub = self.create_publisher(
             Twist,
@@ -136,6 +142,36 @@ class ActionNavigationNode(Node):
             String,
             self.config.grasp_status_topic,
             self.on_grasp_status,
+            10,
+        )
+        self.pick_goal_sub = self.create_subscription(
+            String,
+            self.config.task_pick_goal_topic,
+            self.on_pick_goal,
+            10,
+        )
+        self.task_status_sub = self.create_subscription(
+            String,
+            self.config.task_status_topic,
+            self.on_task_status,
+            10,
+        )
+
+        # 通用导航接口：任务执行器通过它让本节点去货架前或 home_pose，
+        # 保持全系统只有本节点控制 /cmd_vel。
+        self.external_nav_goal_id = None
+        self.external_nav_purpose = None
+        self.last_navigation_status_payload = None
+        self.last_navigation_status_publish_time = 0.0
+        self.navigation_goal_sub = self.create_subscription(
+            String,
+            self.config.navigation_goal_topic,
+            self.on_navigation_goal,
+            10,
+        )
+        self.navigation_status_pub = self.create_publisher(
+            String,
+            self.config.navigation_status_topic,
             10,
         )
 
@@ -261,8 +297,103 @@ class ActionNavigationNode(Node):
 
         event = str(payload.get("event") or "")
         state = str(payload.get("state") or "")
-        if event == "safe_stop" or state == "SAFE_STOP":
+        if (
+            (event == "safe_stop" or state == "SAFE_STOP")
+            and self.grasp_handoff_active
+        ):
             self.exit_grasp_handoff("grasp_executor_safe_stop")
+            self.grasp_failure_hold = True
+            reason = str(payload.get("reason") or "grasp_executor_safe_stop")
+            self.publish_ready(False, reason)
+            self.last_ready_reason = reason
+            self.set_phase(Phase.SAFE_STOP)
+
+    def on_pick_goal(self, msg):
+        try:
+            payload = json.loads(msg.data)
+        except json.JSONDecodeError:
+            return
+
+        label = str(payload.get("target_label") or "").strip()
+        if not label:
+            return
+
+        self.latest_pick_goal = payload
+        self.latest_pick_goal_time = time.monotonic()
+        if self.phase == Phase.SAFE_STOP:
+            if self.grasp_failure_hold:
+                return
+            self.external_nav_goal_id = None
+            self.external_nav_purpose = None
+            self.current_goal = None
+            self.navigation_mode = "approach"
+            self.ready_task_id = None
+            self.ready_target_snapshot = None
+            self.grasp_handoff_active = False
+            self.set_phase(Phase.SELECT_TASK)
+
+    def on_task_status(self, msg):
+        try:
+            self.latest_task_status = json.loads(msg.data)
+            self.latest_task_status_time = time.monotonic()
+        except json.JSONDecodeError:
+            return
+
+    def task_allows_autonomous_pick_navigation(self):
+        if self.latest_task_status is None:
+            return True
+        state = str(self.latest_task_status.get("state") or "")
+        return state in {
+            "WAIT_PICK_READY",
+            "START_PICK",
+            "WAIT_PICK_DONE",
+        }
+
+    def fresh_pick_goal(self):
+        if self.latest_pick_goal is None:
+            return None
+        age = time.monotonic() - self.latest_pick_goal_time
+        if age > 3.0:
+            return None
+        return self.latest_pick_goal
+
+    def task_from_pick_goal(self, base_task):
+        pick_goal = self.fresh_pick_goal()
+        if pick_goal is None:
+            return base_task
+
+        task = dict(base_task or {})
+        task["task_id"] = pick_goal.get("task_id")
+        task["original_instruction"] = (
+            pick_goal.get("raw_instruction")
+            or task.get("original_instruction", "")
+        )
+
+        target = dict(task.get("target") or {})
+        goal_label = str(pick_goal.get("target_label") or "").lower()
+        old_label = str(target.get("label") or "").lower()
+
+        # 如果 VLM 还在发布上一轮/放置阶段的目标，不能继承旧目标的
+        # object_id、pose_world、bbox，否则第二轮会继续围着旧物体观察。
+        if old_label and goal_label and goal_label not in old_label and old_label not in goal_label:
+            target = {}
+
+        target["label"] = pick_goal.get("target_label")
+        target["color"] = pick_goal.get("target_color")
+        target["category"] = pick_goal.get("target_category")
+        source_surface = str(
+            pick_goal.get("expected_source_surface") or ""
+        ).lower()
+        if source_surface in ("table", "shelf"):
+            target["support_surface"] = source_surface
+            target["source_location"] = source_surface
+            target["on_table"] = source_surface == "table"
+            target["on_shelf"] = source_surface == "shelf"
+        target["requires_reobserve"] = not bool(
+            target.get("object_id") and target.get("pose_world")
+        )
+        task["target"] = target
+        return task
 
     def enter_grasp_handoff(self, reason):
         if not self.grasp_handoff_active:
@@ -270,6 +401,7 @@ class ActionNavigationNode(Node):
                 f"enter grasp handoff: {reason}"
             )
         self.grasp_handoff_active = True
+        self.grasp_failure_hold = False
         self.navigator.stop()
         self.visual_servo.stop(reset_stability=False)
         self.cmd_vel_pub.publish(Twist())
@@ -280,6 +412,74 @@ class ActionNavigationNode(Node):
                 f"exit grasp handoff: {reason}"
             )
         self.grasp_handoff_active = False
+
+    def publish_navigation_status(self, state, reason=""):
+        payload = {
+            "goal_id": self.external_nav_goal_id,
+            "purpose": self.external_nav_purpose,
+            "state": state,
+            "phase": self.phase,
+            "reason": reason,
+            "time": time.time(),
+            "robot_pose": (
+                self.robot_pose.__dict__
+                if self.robot_pose is not None
+                else None
+            ),
+        }
+        msg = String()
+        msg.data = json.dumps(payload, ensure_ascii=False)
+        self.navigation_status_pub.publish(msg)
+        self.last_navigation_status_payload = dict(payload)
+        self.last_navigation_status_publish_time = time.monotonic()
+
+    def publish_navigation_status_heartbeat(self):
+        if not self.last_navigation_status_payload:
+            return
+        if self.external_nav_goal_id is None:
+            return
+        if self.phase not in (Phase.EXTERNAL_NAVIGATE, Phase.SAFE_STOP):
+            return
+
+        now = time.monotonic()
+        if now - self.last_navigation_status_publish_time < 1.0:
+            return
+
+        payload = dict(self.last_navigation_status_payload)
+        payload["phase"] = self.phase
+        payload["time"] = time.time()
+        payload["robot_pose"] = (
+            self.robot_pose.__dict__
+            if self.robot_pose is not None
+            else None
+        )
+
+        msg = String()
+        msg.data = json.dumps(payload, ensure_ascii=False)
+        self.navigation_status_pub.publish(msg)
+        self.last_navigation_status_payload = dict(payload)
+        self.last_navigation_status_publish_time = now
+
+    def on_navigation_goal(self, message):
+        try:
+            payload = json.loads(message.data)
+            pose = payload.get("pose") or {}
+            self.external_nav_goal_id = payload.get("goal_id")
+            self.external_nav_purpose = payload.get("purpose")
+            self.current_goal = Pose2D(
+                x=float(pose["x"]),
+                y=float(pose["y"]),
+                yaw=float(pose["yaw"]),
+            )
+            self.navigation_mode = "external"
+            self.current_dock_route = None
+            self.current_dock_controller = None
+            self.navigator.stop()
+            self.visual_servo.stop(reset_stability=False)
+            self.publish_navigation_status("ACCEPTED", "external_goal_accepted")
+            self.set_phase(Phase.EXTERNAL_NAVIGATE)
+        except Exception as exc:
+            self.publish_navigation_status("FAILED", f"bad_navigation_goal: {exc}")
 
     def target_is_table_target(self, target):
         return not (
@@ -736,7 +936,7 @@ class ActionNavigationNode(Node):
 
         task = bind_task_target_from_objects(
             self.latest_detection_scene,
-            get_active_task(self.latest_scene),
+            self.task_from_pick_goal(get_active_task(self.latest_scene)),
         )
         observation_id = (
             self.latest_detection_scene.get("observation_seq"),
@@ -934,13 +1134,19 @@ class ActionNavigationNode(Node):
             self.handle_pregrasp_adjust()
         elif self.phase == Phase.READY_FOR_GRASP:
             self.handle_ready_for_grasp()
+        elif self.phase == Phase.EXTERNAL_NAVIGATE:
+            self.handle_external_navigate()
         elif self.phase == Phase.SAFE_STOP:
             self.navigator.stop()
 
+        self.publish_navigation_status_heartbeat()
         self.publish_ready_heartbeat()
 
     def handle_wait_scene(self):
         self.navigator.stop()
+        if not self.task_allows_autonomous_pick_navigation():
+            self.publish_ready(False, "task_not_waiting_for_pick")
+            return
         if self.latest_scene is not None:
             self.set_phase(Phase.SELECT_TASK)
 
@@ -951,12 +1157,20 @@ class ActionNavigationNode(Node):
         perception_scene = (
             self.latest_detection_scene or self.latest_scene
         )
+        base_task = self.task_from_pick_goal(
+            get_active_task(self.latest_scene),
+        )
         return bind_task_target_from_objects(
             perception_scene,
-            get_active_task(self.latest_scene),
+            base_task,
         )
 
     def handle_select_task(self):
+        if not self.task_allows_autonomous_pick_navigation():
+            self.publish_ready(False, "task_not_waiting_for_pick")
+            self.set_phase(Phase.WAIT_SCENE)
+            return
+
         self.active_task = self.bind_current_task()
         if self.active_task is None:
             self.publish_ready(False, "no_active_task")
@@ -977,6 +1191,8 @@ class ActionNavigationNode(Node):
             self.approach_retry_count
             * self.config.approach_retry_backoff_m
         )
+        if not self.target_is_table_target(target):
+            distance_extra = 0.0
         motion_goal = None
 
         if self.config.enable_motion_handoff_stance:
@@ -1082,6 +1298,11 @@ class ActionNavigationNode(Node):
         self.set_phase(Phase.SAFE_STOP)
 
     def handle_plan(self):
+        if not self.task_allows_autonomous_pick_navigation():
+            self.publish_ready(False, "task_not_waiting_for_pick")
+            self.set_phase(Phase.WAIT_SCENE)
+            return
+
         if self.robot_pose is None:
             self.publish_ready(False, "waiting_odom")
             return
@@ -1357,6 +1578,11 @@ class ActionNavigationNode(Node):
             if (
                 self.navigation_mode == "approach"
                 and fresh_target_detected
+                and target_is_visible_for_servo(
+                    self.latest_detection_scene,
+                    self.active_task,
+                    self.config,
+                )
             ):
                 target = self.active_task.get("target") or {}
                 self.observer.stop()
@@ -1510,6 +1736,22 @@ class ActionNavigationNode(Node):
         target = self.apply_pregrasp_metadata(target)
         self.active_task = dict(self.active_task or {})
         self.active_task["target"] = target
+
+        if (
+            not close_range_locked
+            and bool(
+                getattr(
+                    self.config,
+                    "close_range_lock_visual_servo_direct_pregrasp",
+                    True,
+                )
+            )
+            and self.close_range_lock_ready(target)
+            and self.grasp_clearance_ready(target)
+        ):
+            close_range_locked = True
+            target["close_range_locked"] = True
+            self.active_task["target"] = target
 
         if close_range_locked:
             self.visual_servo.stop(reset_stability=False)
@@ -1768,12 +2010,17 @@ class ActionNavigationNode(Node):
             and abs(v - target_v) <= self.config.pregrasp_v_tolerance
         )
 
+        target_close_range_locked = (
+            close_range_locked
+            or bool(target.get("close_range_locked"))
+        )
+
         pregrasp_view_ready = (
             full_object_visible
             and box_size_reasonable
             and uv_safe
         )
-        if close_range_locked and allow_close_lock_pregrasp:
+        if target_close_range_locked and allow_close_lock_pregrasp:
             pregrasp_view_ready = True
 
         expected_spine = self.pregrasp_target_spine
@@ -1808,7 +2055,6 @@ class ActionNavigationNode(Node):
 
             # 头部目标：如果目标在画面偏下，头回正；如果目标偏上，稍微低头。
             # 注意：你当前系统里 pitch 越接近 0 越回正，-0.65 更俯视。
-        v_error = v - target_v
         head_error = float(target_head) - current_head
         head_step = max(
             -self.config.pregrasp_head_pitch_step,
@@ -1816,11 +2062,9 @@ class ActionNavigationNode(Node):
         )
         next_head = current_head + head_step
 
-        # 目标在画面偏下时，头部更回正一点，防止腰下降后丢视野。
-        if v_error > self.config.pregrasp_v_tolerance * 0.4:
-            next_head += self.config.pregrasp_head_pitch_step
-        elif v_error < -self.config.pregrasp_v_tolerance * 0.4:
-            next_head -= self.config.pregrasp_head_pitch_step
+        # 预抓取阶段不再根据目标 v 坐标额外回正头部。
+        # 近距离时方块容易贴近画面下沿，继续回正会把目标推出视野；
+        # 这里让 head_pitch 严格收敛到配置里的 pregrasp_final_head_pitch。
 
         next_head = max(
                 self.config.pregrasp_head_pitch_min,
@@ -1851,9 +2095,28 @@ class ActionNavigationNode(Node):
             elapsed >= self.config.pregrasp_adjust_min_sec
         )
 
+        close_range_timeout_ready = (
+            bool(
+                getattr(
+                    self.config,
+                    "pregrasp_allow_timeout_ready",
+                    False,
+                )
+            )
+            and elapsed >= self.config.pregrasp_adjust_timeout_sec
+            and target_close_range_locked
+            and pregrasp_view_ready
+            and self.close_range_lock_ready(target)
+            and self.grasp_clearance_ready(target)
+        )
+
         view_and_grasp_ready = (
             min_time_ready
             and pregrasp_view_ready
+            and (
+                (spine_ready and head_ready)
+                or close_range_timeout_ready
+            )
             and self.grasp_clearance_ready(target)
         )
 
@@ -1870,7 +2133,9 @@ class ActionNavigationNode(Node):
             self.ready_target_snapshot = dict(target)
             self.set_phase(Phase.READY_FOR_GRASP)
             reason = "pregrasp_head_spine_adjusted_target_visible"
-            if close_range_locked:
+            if close_range_timeout_ready:
+                reason = "pregrasp_timeout_close_range_locked_ready"
+            elif target_close_range_locked:
                 reason = "pregrasp_close_range_locked_ready"
             self.publish_ready(
                 True,
@@ -1884,6 +2149,21 @@ class ActionNavigationNode(Node):
                     False,
                     "pregrasp_view_ready_waiting_stable_frames",
                 )
+            elif close_range_timeout_ready:
+                self.publish_ready(
+                    False,
+                    "pregrasp_timeout_close_range_waiting_stable_frames",
+                )
+            elif not spine_ready:
+                self.publish_ready(
+                    False,
+                    "pregrasp_adjust_timeout_spine_not_ready",
+                )
+            elif not head_ready:
+                self.publish_ready(
+                    False,
+                    "pregrasp_adjust_timeout_head_not_ready",
+                )
             else:
                 self.publish_ready(
                     False,
@@ -1891,7 +2171,12 @@ class ActionNavigationNode(Node):
                 )
             return
 
-        self.publish_ready(False, "pregrasp_adjusting_head_and_spine")
+        if not spine_ready:
+            self.publish_ready(False, "pregrasp_adjusting_spine")
+        elif not head_ready:
+            self.publish_ready(False, "pregrasp_adjusting_head")
+        else:
+            self.publish_ready(False, "pregrasp_adjusting_head_and_spine")
 
     def handle_ready_for_grasp(self):
         self.navigator.stop()
@@ -1909,7 +2194,9 @@ class ActionNavigationNode(Node):
             self.publish_ready(True, "grasp_handoff_active_ready_kept")
             return
 
-        current_task = get_active_task(self.latest_scene or {})
+        current_task = self.task_from_pick_goal(
+            get_active_task(self.latest_scene or {}),
+        )
         current_task_id = (
             current_task.get("task_id")
             if current_task is not None
@@ -1975,6 +2262,48 @@ class ActionNavigationNode(Node):
             self.ready_target_snapshot or {}
         )
         self.publish_ready(True, "ready_latched_waiting_grasp")
+
+    def handle_external_navigate(self):
+        if self.robot_pose is None or self.current_goal is None:
+            self.navigator.stop()
+            self.publish_navigation_status("FAILED", "missing_robot_pose_or_goal")
+            self.set_phase(Phase.SAFE_STOP)
+            return
+
+        distance = self.navigator.distance_to_goal(
+            self.robot_pose,
+            self.current_goal,
+        )
+        yaw_error = abs(normalize_angle(self.current_goal.yaw - self.robot_pose.yaw))
+        external_xy_tolerance = max(
+            float(self.config.goal_xy_tolerance),
+            float(getattr(self.config, "task_nav_xy_tolerance", 0.10)),
+        )
+        if self.external_nav_purpose == "home":
+            external_yaw_tolerance = 0.10
+        elif self.external_nav_purpose in ("place", "reference_area"):
+            external_yaw_tolerance = 0.18
+        else:
+            external_yaw_tolerance = float(
+                getattr(
+                    self.config,
+                    "task_nav_yaw_tolerance",
+                    self.config.goal_yaw_tolerance,
+                )
+            )
+        external_arrived = (
+            distance <= external_xy_tolerance
+            and yaw_error <= external_yaw_tolerance
+        )
+
+        if self.navigator.reached(self.robot_pose, self.current_goal) or external_arrived:
+            self.navigator.stop()
+            self.publish_navigation_status("ARRIVED", "external_goal_arrived")
+            self.set_phase(Phase.SAFE_STOP)
+            return
+
+        self.publish_navigation_status("MOVING", "external_goal_moving")
+        self.navigator.step(self.robot_pose, self.current_goal)
 
 
 def main():

@@ -1,4 +1,5 @@
 from geometry_msgs.msg import Twist
+import math
 
 from .scene_reader import get_servo_vertical_target
 
@@ -108,6 +109,23 @@ class VisualServo:
             or bool(target.get("on_shelf"))
         )
 
+    def _is_shelf_target(self, target):
+        return not self._is_table_target(target)
+
+    def _yaw_error_to_target(self, target, robot_pose):
+        pose_world = target.get("pose_world") or {}
+        if robot_pose is None or not hasattr(robot_pose, "yaw"):
+            return None
+        if "x" not in pose_world or "y" not in pose_world:
+            return None
+
+        desired_yaw = math.atan2(
+            float(pose_world["y"]) - float(robot_pose.y),
+            float(pose_world["x"]) - float(robot_pose.x),
+        )
+        error = desired_yaw - float(robot_pose.yaw)
+        return math.atan2(math.sin(error), math.cos(error))
+
     def _target_u(self, target):
         if self._is_table_target(target):
             return float(
@@ -165,10 +183,26 @@ class VisualServo:
         )
         if abs(u - self._target_u(target)) > self.config.servo_u_tolerance:
             return False
+        if self._is_shelf_target(target):
+            yaw_error = self._yaw_error_to_target(target, robot_pose)
+            if yaw_error is None:
+                return False
+            if abs(yaw_error) > float(
+                getattr(
+                    self.config,
+                    "servo_shelf_yaw_tolerance_rad",
+                    0.16,
+                )
+            ):
+                return False
         # 桌边双臂抓取的底盘伺服只负责横向和距离；垂直视角由
         # pregrasp_adjust 里的头部/腰部闭环处理，避免在这里卡住不降腰。
+        # 货架抓取时，相机常会在货架近距离看到目标偏下/偏上；
+        # 底盘视觉伺服只能调横向和距离，不能可靠地把 v 拉回中心。
+        # 因此 shelf 目标不把垂直像素误差作为 ready 硬条件。
         if (
             not self._is_table_dual_target(target)
+            and not self._is_shelf_target(target)
             and abs(v - target_v) > v_tolerance
         ):
             return False
@@ -212,6 +246,47 @@ class VisualServo:
             else distance - desired_distance
         )
 
+        if self._is_shelf_target(target):
+            yaw_error = self._yaw_error_to_target(target, robot_pose)
+            yaw_tolerance = float(
+                getattr(
+                    self.config,
+                    "servo_shelf_yaw_tolerance_rad",
+                    0.16,
+                )
+            )
+            if yaw_error is None:
+                self.stop()
+                return ServoState.REOBSERVE
+            if abs(yaw_error) > yaw_tolerance:
+                self.reset()
+                msg.angular.z = clamp(
+                    float(
+                        getattr(
+                            self.config,
+                            "servo_shelf_yaw_gain",
+                            0.55,
+                        )
+                    )
+                    * yaw_error,
+                    -float(
+                        getattr(
+                            self.config,
+                            "servo_shelf_max_angular_speed",
+                            self.config.servo_max_angular_speed,
+                        )
+                    ),
+                    float(
+                        getattr(
+                            self.config,
+                            "servo_shelf_max_angular_speed",
+                            self.config.servo_max_angular_speed,
+                        )
+                    ),
+                )
+                self.publisher.publish(msg)
+                return ServoState.MOVING
+
         # 目标已经出现在画面边缘时，不要退回观察状态。
         # 桌边双臂抓取时，是否后退要由世界距离决定，避免画面裁切和距离闭环打架。
         if v > self.config.servo_max_v:
@@ -246,7 +321,11 @@ class VisualServo:
 
         # 桌边双臂抓取接近后，目标常会落在画面偏下位置。
         # 这里不再用普通 v 误差阻塞 ALIGNED，后续 pregrasp_adjust 会调头和腰。
-        if abs(v - target_v) > v_tolerance and not table_dual:
+        if (
+            abs(v - target_v) > v_tolerance
+            and not table_dual
+            and not self._is_shelf_target(target)
+        ):
             if self._is_table_target(target):
                 self.reset()
                 v_error = v - target_v

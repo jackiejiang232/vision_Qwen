@@ -78,16 +78,12 @@ def build_approach_goal_from_target(
     extra = max(0.0, float(distance_extra))
 
     if surface == "shelf":
-        distance = config.approach_distance_shelf + extra
-        # 货架可接近面位于世界坐标x增大的一侧。
-        goal_x = target_x + distance
-        goal_y = target_y
-        yaw = yaw_to_face_target(
-            goal_x,
-            goal_y,
-            target_x,
-            target_y,
-        )
+        # 货架目标的Pose3D在近距离/裁边时会漂到货架内部。
+        # 底盘站位必须固定在货架前安全线，只允许沿货架方向小幅对齐。
+        shelf_front = SEARCH_WAYPOINTS["shelf_front"]
+        goal_x = float(shelf_front.x)
+        goal_y = clamp(target_y, 0.55, 1.05)
+        yaw = float(shelf_front.yaw)
     else:
         return _build_table_approach_goal(
             target_x,

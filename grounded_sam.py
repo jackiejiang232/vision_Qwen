@@ -150,6 +150,27 @@ def parse_args():
     )
 
     parser.add_argument(
+        "--target-box-threshold",
+        type=float,
+        default=0.30,
+        help="抓取目标动态查询时使用的较低框阈值，适应近距离/裁边目标",
+    )
+
+    parser.add_argument(
+        "--target-text-threshold",
+        type=float,
+        default=0.22,
+        help="抓取目标动态查询时使用的较低文本阈值",
+    )
+
+    parser.add_argument(
+        "--vertical-box-aspect-ratio",
+        type=float,
+        default=1.25,
+        help="判定竖放箱体的最小检测框高宽比",
+    )
+
+    parser.add_argument(
         "--output",
         type=Path,
         default=DEFAULT_OUTPUT,
@@ -405,6 +426,7 @@ def run_sam(
     boxes_xyxy,
     phrases,
     device,
+    target_label=None,
 ):
     height, width = image_rgb.shape[:2]
 
@@ -420,10 +442,14 @@ def run_sam(
     all_scores = []
 
     for index, box in enumerate(boxes_xyxy):
+        # 动态抓取查询可能返回错误的候选短语，例如把箱体标成
+        # white cuboid。此时用任务目标标签生成已有的颜色提示点，
+        # 避免 SAM 按错误短语去分割货架背景。HSV 阈值本身不变。
+        prompt_label = target_label or phrases[index]
         point_coords, point_labels = get_color_prompt_points(
             image_bgr=image_bgr,
             box_xyxy=box.detach().cpu().numpy(),
-            label=phrases[index],
+            label=prompt_label,
         )
 
         transformed_box = predictor.transform.apply_boxes_torch(
@@ -491,6 +517,7 @@ def infer_frame(
     box_threshold,
     text_threshold,
     device,
+    target_label=None,
 ):
     boxes, logits, phrases = run_grounding_dino(
         model=dino_model,
@@ -535,8 +562,9 @@ def infer_frame(
     image_rgb=image_rgb,
     image_bgr=frame_bgr,
     boxes_xyxy=boxes_xyxy,
-    phrases=phrases,
-    device=device,
+        phrases=phrases,
+        device=device,
+        target_label=target_label,
     )
 
     return (
@@ -625,11 +653,11 @@ def estimate_mask_color(image_bgr, mask, label=None):
     )
 
     yellow_ratio = np.mean(
-    (hue >= 18)
-    & (hue <= 42)
-    & (sat > 40)
-    & (val > 120)
-)
+        (hue >= 18)
+        & (hue <= 42)
+        & (sat > 40)
+        & (val > 120)
+    )
 
     brown_ratio = np.mean(
         (hue >= 5)
@@ -758,6 +786,7 @@ def create_detection_records(
     image_bgr=None,
     depth_image=None,
     intrinsics=None,
+    vertical_aspect_ratio=1.25,
 ):
     boxes_numpy = boxes_xyxy.cpu().numpy()
     records = []
@@ -773,17 +802,37 @@ def create_detection_records(
             if image_bgr is not None
             else None
         )
-        centroid_uv = mask_centroid(mask)
+        mask_centroid_uv = mask_centroid(mask)
+        box_values = [float(value) for value in box.tolist()]
+        box_width = max(0.0, box_values[2] - box_values[0])
+        box_height = max(0.0, box_values[3] - box_values[1])
+        bbox_centroid_uv = [
+            (box_values[0] + box_values[2]) * 0.5,
+            (box_values[1] + box_values[3]) * 0.5,
+        ]
+        is_vertical_box = (
+            box_width > 1.0
+            and box_height >= box_width * float(vertical_aspect_ratio)
+            and box_height >= 60.0
+        )
+        # 竖放箱体的 SAM 掩膜可能只覆盖斜侧面；用 DINO 框中心作为
+        # 平面目标中心更稳定，深度仍取 SAM 掩膜的中位数。
+        center_uv = (
+            bbox_centroid_uv if is_vertical_box else mask_centroid_uv
+        )
 
         pose_camera = None
         size_3d = None
         label_lower = str(phrases[index]).lower()
         corrected_label = phrases[index]
+        # estimated_color 只作为一致性证据，不覆盖 GroundingDINO 的
+        # 类别标签。否则“white cylinder + yellow 外观”会被伪装成
+        # yellow box，导航就会朝错误物体移动。
         if depth_image is not None and intrinsics is not None:
             pose_camera = build_pose_camera_from_detection(
                 depth_image=depth_image,
                 mask=mask,
-                centroid_uv=centroid_uv,
+                centroid_uv=center_uv,
                 intrinsics=intrinsics,
     )
             size_3d = estimate_box_size_from_mask_depth(
@@ -791,26 +840,13 @@ def create_detection_records(
                 mask=mask,
                 intrinsics=intrinsics,
             )
-            label_lower = str(phrases[index]).lower()
-            if estimated_color in ("pink", "brown", "yellow"):
-                corrected_label = f"{estimated_color} box"
-            elif estimated_color == "white":
-                if "cylinder" in label_lower:
-                    corrected_label = "white cylinder"
-                elif "cuboid" in label_lower:
-                    corrected_label = "white cuboid"
-                elif "cube" in label_lower:
-                    corrected_label = "white cube"
-                else:
-                    corrected_label = phrases[index]
-            else:
-                corrected_label = phrases[index]
         records.append(
             {
                 "index": index,
                 "label": corrected_label,
                 "raw_label": phrases[index],
                 "corrected_label": corrected_label,
+                "estimated_color": estimated_color,
                 "color_consistent": color_consistent(
                     phrases[index],
                     estimated_color,
@@ -820,7 +856,15 @@ def create_detection_records(
                 "sam_score": float(mask_scores[index]),
                 "box_xyxy": mask_bbox(mask) or box.tolist(),
                 "mask_area": int(mask.sum()),
-                "centroid_uv": mask_centroid(mask),
+                "centroid_uv": center_uv,
+                "mask_centroid_uv": mask_centroid_uv,
+                "bbox_centroid_uv": bbox_centroid_uv,
+                "center_source": (
+                    "bbox_center_vertical_box"
+                    if is_vertical_box
+                    else "mask_centroid"
+                ),
+                "vertical_box_candidate": is_vertical_box,
                 "pose_camera": pose_camera,
                 "pose_world": None,
                 "size_3d": size_3d,
@@ -1025,6 +1069,8 @@ class GroundedSamCameraNode(Node):
         self.processed_sequence = -1
         self.busy = False
         self.text_prompt = args.text
+        self.query_target_label = None
+        self.query_role = ""
         self.text_lock = threading.Lock()
         self.scene_memory = SceneMemory()
 
@@ -1164,9 +1210,18 @@ class GroundedSamCameraNode(Node):
 
             with self.text_lock:
                 self.text_prompt = prompt
+                self.query_target_label = (
+                    str(payload.get("target_label") or "").strip()
+                    or None
+                )
+                self.query_role = str(
+                    payload.get("query_role") or ""
+                ).strip()
 
             self.get_logger().info(
-                f"GroundingDINO检测词已更新：{prompt}"
+                f"GroundingDINO检测词已更新：{prompt}，"
+                f"query_role={self.query_role or 'default'}，"
+                f"target_label={self.query_target_label or 'none'}"
             )
 
         except Exception as error:
@@ -1285,6 +1340,30 @@ class GroundedSamCameraNode(Node):
         try:
             with self.text_lock:
                 text_prompt = self.text_prompt
+                query_target_label = self.query_target_label
+                query_role = self.query_role
+
+            targeted_pick_query = query_role == "pick_target_only" and bool(
+                query_target_label
+            )
+            box_threshold = (
+                min(self.args.box_threshold, self.args.target_box_threshold)
+                if targeted_pick_query
+                else self.args.box_threshold
+            )
+            text_threshold = (
+                min(self.args.text_threshold, self.args.target_text_threshold)
+                if targeted_pick_query
+                else self.args.text_threshold
+            )
+            # 抓取阶段使用任务目标的精确短语作为 GroundingDINO 的实际
+            # caption。任务节点仍保留对比词元数据，但不让其他颜色类别
+            # 抢占候选框，避免黄色箱被标成 pink、背景被标成 yellow。
+            inference_prompt = (
+                f"{query_target_label} ."
+                if targeted_pick_query
+                else text_prompt
+            )
             (
                 boxes_xyxy,
                 logits,
@@ -1295,10 +1374,13 @@ class GroundedSamCameraNode(Node):
                 frame_bgr=frame,
                 dino_model=self.dino_model,
                 sam_predictor=self.sam_predictor,
-                text_prompt=text_prompt,
-                box_threshold=self.args.box_threshold,
-                text_threshold=self.args.text_threshold,
+                text_prompt=inference_prompt,
+                box_threshold=box_threshold,
+                text_threshold=text_threshold,
                 device=self.device,
+                target_label=(
+                    query_target_label if targeted_pick_query else None
+                ),
             )
 
             inference_ms = (
@@ -1314,6 +1396,7 @@ class GroundedSamCameraNode(Node):
                 image_bgr=frame,
                 depth_image=depth,
                 intrinsics=intrinsics,
+                vertical_aspect_ratio=self.args.vertical_box_aspect_ratio,
             )
             for record in records:
                 record["pose_world"] = transform_pose_camera_to_world(
@@ -1397,7 +1480,7 @@ class GroundedSamCameraNode(Node):
                 records=records,
                 inference_ms=inference_ms,
                 header=header,
-                caption=text_prompt,
+                caption=inference_prompt,
             )
 
             self.publish_annotated_image(

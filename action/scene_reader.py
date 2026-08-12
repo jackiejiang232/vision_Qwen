@@ -32,6 +32,10 @@ def _normalize_flat_scene(scene):
     target_object_id = scene.get("target_object_id")
     target_label = scene.get("target_label")
     target_pose_world = scene.get("target_pose_world")
+    reference_pose_world = (
+        scene.get("reference_pose_world")
+        or scene.get("place_pose_world")
+    )
     requires_reobserve = bool(scene.get("requires_reobserve", True))
     support_surface = _surface_from_flat_scene(scene)
 
@@ -56,6 +60,8 @@ def _normalize_flat_scene(scene):
         "place_type": scene.get("place_type"),
         "reference_object_id": scene.get("reference_object_id"),
         "reference_label": scene.get("reference_label"),
+        "reference_pose_world": reference_pose_world,
+        "temporal_reference": scene.get("temporal_reference"),
         "spatial_relation": scene.get("spatial_relation"),
         "pose_world": scene.get("place_pose_world"),
         "requires_planning": True,
@@ -78,6 +84,26 @@ def _normalize_flat_scene(scene):
                 "confidence": scene.get("confidence", 0.0),
                 "dino_score": scene.get("confidence", 0.0),
                 "requires_reobserve": requires_reobserve,
+            }
+        )
+
+    # 连续任务需要在任务开始时同时 Ground 放置参考物体（例如白色圆柱）。
+    reference_object_id = scene.get("reference_object_id")
+    reference_label = scene.get("reference_label")
+
+    if reference_object_id and reference_pose_world:
+        objects.append(
+            {
+                "object_id": reference_object_id,
+                "label": reference_label,
+                "semantic_role": "place_reference",
+                "location": "shelf",
+                "pose_world": reference_pose_world,
+                "support_surface": "shelf",
+                "on_shelf": True,
+                "confidence": scene.get("reference_confidence", 0.0),
+                "dino_score": scene.get("reference_confidence", 0.0),
+                "requires_reobserve": False,
             }
         )
 
@@ -180,7 +206,9 @@ def choose_search_areas(task):
         return ["shelf_front"]
 
     # 目标来源未知时必须搜索两个区域，不能用放置目的地猜抓取来源。
-    return ["table_front", "shelf_front"]
+    # 比赛场景里桌面目标通常在初始/回原点视角已可见；真正缺失位姿的
+    # 目标更常见于货架遮挡，因此优先近距离看货架，再回桌面兜底。
+    return ["shelf_front", "table_front"]
 
 
 def choose_search_area(task):
@@ -248,6 +276,24 @@ def target_is_visible_for_servo(scene, task, config):
     )
     x1, y1, x2, y2 = [float(value) for value in box_xyxy]
     margin = float(config.servo_bbox_margin_px)
+    bbox_area_ratio = (
+        max(0.0, x2 - x1)
+        * max(0.0, y2 - y1)
+        / float(config.image_width * config.image_height)
+    )
+    target_surface = str(target.get("support_surface") or "").lower()
+    is_shelf_target = target_surface == "shelf" or bool(target.get("on_shelf"))
+    is_table_dual_target = (
+        not is_shelf_target
+        and target.get("selected_arm") == "dual"
+    )
+
+    # 目标框覆盖过大时通常是箱子与桌面/相邻箱体被SAM合并，
+    # 不能用它计算视觉伺服误差。
+    if bbox_area_ratio > 0.60:
+        return False
+    if is_shelf_target and y2 > float(config.image_height) - margin:
+        return False
 
     box_inside = (
         x1 >= margin
@@ -261,14 +307,18 @@ def target_is_visible_for_servo(scene, task, config):
     )
     centroid_inside = (
         0.0 <= u < config.image_width
-        and config.servo_min_v <= v <= config.servo_max_v
-        and abs(v - target_v) <= v_tolerance
+        and (
+            is_table_dual_target
+            or (
+                config.servo_min_v <= v <= config.servo_max_v
+                and abs(v - target_v) <= v_tolerance
+            )
+        )
     )
 
-    # 进入视觉伺服时允许目标轻微贴边，因为伺服本身可以
-    # 通过转动底盘把目标带回画面。最终ready仍由VisualServo
-    # 的完整框检查把关，不能把裁边目标直接交给抓取。
-    return box_large_enough and centroid_inside
+    # 进入视觉伺服前必须先拿到完整目标框。贴边或越界框不能
+    # 再驱动底盘，否则机器人会追着桌面/墙面等合并区域运动。
+    return box_inside and box_large_enough and centroid_inside
 
 
 KNOWN_COLORS = ("pink", "brown", "yellow", "white")
@@ -285,9 +335,13 @@ def _canonical_object_label(obj):
 
 
 def _resolved_object_color(obj, canonical_label):
-    estimated_color = str(
-        obj.get("estimated_color") or ""
-    ).lower()
+    # 视觉节点一旦提供 estimated_color，就以图像颜色估计为准。
+    # 即使结果为 unknown，也不能退回使用可能错误的 DINO 文字标签。
+    if "estimated_color" in obj:
+        estimated_color = str(obj.get("estimated_color") or "").lower()
+        return estimated_color if estimated_color in KNOWN_COLORS else ""
+
+    estimated_color = str(obj.get("estimated_color") or "").lower()
     if estimated_color in KNOWN_COLORS:
         return estimated_color
 
@@ -300,8 +354,22 @@ def _resolved_object_color(obj, canonical_label):
 
 def _object_matches_task(obj, target):
     label = _canonical_object_label(obj)
+    target_label = str(target.get("label") or "").lower()
     color = str(target.get("color") or "").lower()
     category = str(target.get("category") or "").lower()
+
+    if not color:
+        for candidate in KNOWN_COLORS:
+            if candidate in target_label:
+                color = candidate
+                break
+
+    if not category:
+        if any(word in target_label for word in ("box", "cube", "cuboid", "block")):
+            category = "box"
+        elif "cylinder" in target_label:
+            category = "cylinder"
+
     resolved_color = _resolved_object_color(obj, label)
 
     if label in ("table", "shelf"):
@@ -311,6 +379,27 @@ def _object_matches_task(obj, target):
         if resolved_color and resolved_color != color:
             return -999.0
         if not resolved_color:
+            return -999.0
+
+    # 桌面抓取目标必须是完整可见的独立物体。贴边或异常大的框通常
+    # 是叠放箱体与桌面/相邻物体被SAM合并，不能让它替换上一帧目标。
+    box = obj.get("box_xyxy") or []
+    if len(box) >= 4 and _canonical_support_surface(target) == "table":
+        x1, y1, x2, y2 = [float(value) for value in box[:4]]
+        margin = 20.0
+        area_ratio = (
+            max(0.0, x2 - x1)
+            * max(0.0, y2 - y1)
+            / (640.0 * 480.0)
+        )
+        if area_ratio > 0.60:
+            return -999.0
+        if (
+            x1 < margin
+            or y1 < margin
+            or x2 > 640.0 - margin
+            or y2 > 480.0 - margin
+        ):
             return -999.0
 
     box_family = ("box", "cube", "cuboid", "block")
@@ -417,6 +506,27 @@ def target_is_plausible_for_search(task, area_name, config):
     if len(box) < 4:
         return False, "bbox_missing"
     x1, y1, x2, y2 = [float(value) for value in box]
+    bbox_area_ratio = (
+        max(0.0, x2 - x1)
+        * max(0.0, y2 - y1)
+        / float(config.image_width * config.image_height)
+    )
+    if bbox_area_ratio > 0.65:
+        return False, "bbox_too_large_for_search"
+
+    # 在桌面搜索位看到的货架目标经常只露出画面底边一小块，
+    # 深度反投影会把它误算成桌面附近目标。桌面候选必须完整落入画面，
+    # 否则继续搜索下一个区域，避免把货架物体当成桌面物体去抓。
+    if expected_surface == "table":
+        margin = float(config.servo_bbox_margin_px)
+        if (
+            x1 < margin
+            or y1 < margin
+            or x2 > float(config.image_width) - margin
+            or y2 > float(config.image_height) - margin
+        ):
+            return False, "table_candidate_bbox_clipped"
+
     # 搜索阶段允许目标贴边：这里只用Pose3D生成较远的预抓取点。
     # 到达后target_is_visible_for_servo()仍会严格要求完整检测框。
     if not (
