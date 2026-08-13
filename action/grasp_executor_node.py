@@ -45,6 +45,14 @@ class GraspExecutorNode(Node):
     def __init__(self):
         super().__init__("grasp_executor_node")
         self.config = CONFIG
+        self.integrated_disabled = bool(
+            getattr(self.config, "integrated_action_mode", False)
+        )
+        if self.integrated_disabled:
+            self.get_logger().info(
+                "integrated action mode: standalone grasp executor disabled"
+            )
+            return
         self.latest_ready = None
         self.latest_ready_rx = 0.0
         self.latest_odom = None
@@ -59,6 +67,8 @@ class GraspExecutorNode(Node):
         self.reset_stable_since = 0.0
         self.state = "WAIT_READY"
         self.manual_sim_pick = False
+        self.simulation_pick = False
+        self.simulation_stage_started_at = 0.0
         self.last_ready_log_at = 0.0
         self.last_ready_target = None
         self.last_idle_request_log_at = 0.0
@@ -94,6 +104,8 @@ class GraspExecutorNode(Node):
                 task_id=payload.get("task_id"),
                 target=target,
             )
+        if self.state not in ("WAIT_READY", "DONE"):
+            return
         if self.config.grasp_auto_start:
             self.start_grasp()
 
@@ -230,6 +242,8 @@ class GraspExecutorNode(Node):
             return
         self.state = "STARTING"
         self.manual_sim_pick = False
+        self.simulation_pick = False
+        self.simulation_stage_started_at = 0.0
         self.pick_executor = None
         self.pending_frames = []
         self.current_control_target = None
@@ -245,6 +259,12 @@ class GraspExecutorNode(Node):
             ready_task_id = str(self.latest_ready.get("task_id") or "")
             ready_profile = self.latest_ready.get("motion_grasp_profile")
             ready_source = self.latest_ready.get("motion_source_area")
+            if self.config.grasp_simulation_mode:
+                self.start_simulated_pick(
+                    task_id=ready_task_id or "unknown",
+                    profile=ready_profile or "automatic_simulation",
+                )
+                return
             if ready_profile is None or ready_source is None:
                 self.start_manual_sim_pick(
                     task_id=ready_task_id or "unknown",
@@ -356,6 +376,55 @@ class GraspExecutorNode(Node):
             ),
         )
         self.publish_status("queued", label="manual_sim_pregrasp", frames=0)
+
+    def start_simulated_pick(self, *, task_id, profile):
+        """Advance a navigation-only integration test without fake joint motion."""
+        self.simulation_pick = True
+        self.manual_sim_pick = False
+        self.pick_executor = None
+        self.pending_frames = []
+        self.current_control_target = None
+        self.state = "EXECUTE_PREGRASP"
+        self.simulation_stage_started_at = time.time()
+        self.publish_status(
+            "simulation_pick_started",
+            task_id=task_id,
+            profile=profile,
+            hint="automatic simulation; no manual grasp confirmation required",
+        )
+        self.publish_status("simulation_stage", stage="pregrasp")
+
+    def advance_simulated_pick(self):
+        if not self.simulation_pick:
+            return
+        if time.time() - self.simulation_stage_started_at < float(
+            self.config.grasp_simulation_stage_sec
+        ):
+            return
+
+        transitions = {
+            "EXECUTE_PREGRASP": ("EXECUTE_APPROACH", "approach"),
+            "EXECUTE_APPROACH": ("EXECUTE_HOLD", "hold"),
+            "EXECUTE_HOLD": ("EXECUTE_LIFT", "lift"),
+            "EXECUTE_LIFT": ("LIFT_DONE", "lift_done"),
+        }
+        transition = transitions.get(self.state)
+        if transition is None:
+            return
+        next_state, stage = transition
+        self.state = next_state
+        self.simulation_stage_started_at = time.time()
+        if stage == "lift_done":
+            self.publish_status(
+                "lift_done_waiting_retreat",
+                simulation=True,
+            )
+            # 保留上面的完成事件供任务总控读取，然后立即允许下一条任务
+            # 的 ready_for_grasp 重新开启一轮自动仿真。
+            self.simulation_pick = False
+            self.state = "WAIT_READY"
+            return
+        self.publish_status("simulation_stage", stage=stage)
 
     def advance_manual_sim_pick(self, command):
         if not self.manual_sim_pick:
@@ -650,6 +719,7 @@ class GraspExecutorNode(Node):
         self.heartbeat_pub.publish(header)
         if self.state == "SAFE_STOP":
             return
+        self.advance_simulated_pick()
         if self.pending_frames:
             self.current_control_target = self.pending_frames.pop(0)
         elif self.state == "RESETTING":

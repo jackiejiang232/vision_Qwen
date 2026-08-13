@@ -8,7 +8,7 @@ from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
-from std_msgs.msg import String
+from std_msgs.msg import Float64MultiArray, Header, String
 from scipy.spatial.transform import Rotation
 from .active_observer import ActiveObserver
 from .motion_astar_nav import make_dock_controller
@@ -32,6 +32,46 @@ from .scene_reader import (
 from .simple_nav import SimpleCmdVelNavigator, normalize_angle
 from .target_lock import SearchTargetLock
 from .visual_servo import ServoState, VisualServo
+
+
+class SafeBaseCommandPublisher:
+    """Send base velocity through the DG safety gateway.
+
+    The safety gateway must remain the only publisher of ``/cmd_vel`` so it
+    can enforce rate limits and publish an explicit zero command on timeout or
+    emergency stop.  The navigation and servo classes only need a small
+    publisher-like object, so keeping this adapter here avoids changing their
+    control logic.
+    """
+
+    CONTROL_VECTOR_LENGTH = 19
+    MAX_LINEAR = 0.45
+    MAX_ANGULAR = 1.20
+
+    def __init__(self, node, config):
+        self.node = node
+        self.config = config
+        self.request_pub = node.create_publisher(
+            Float64MultiArray,
+            config.dg_control_request_topic,
+            10,
+        )
+        self.heartbeat_pub = node.create_publisher(
+            Header,
+            config.dg_control_heartbeat_topic,
+            10,
+        )
+
+    def publish(self, msg):
+        values = [0.0] * self.CONTROL_VECTOR_LENGTH
+        # Keep the producer-side request inside the gateway contract.  The
+        # gateway still validates and rate-limits it; this clamp prevents a
+        # navigation gain from turning a normal request into an avoidable
+        # emergency stop.
+        values[0] = max(-self.MAX_LINEAR, min(self.MAX_LINEAR, float(msg.linear.x)))
+        values[1] = max(-self.MAX_ANGULAR, min(self.MAX_ANGULAR, float(msg.angular.z)))
+        self.request_pub.publish(Float64MultiArray(data=values))
+        self.heartbeat_pub.publish(Header())
 
 
 class Phase:
@@ -80,6 +120,8 @@ class ActionNavigationNode(Node):
         self.pregrasp_start_spine = None
         self.pregrasp_target_spine = None
         self.pregrasp_target_head_pitch = None
+        self.pregrasp_commanded_spine = None
+        self.pregrasp_commanded_head_pitch = None
         self.head_state_time = 0.0
         self.current_dock_route = None
         self.current_dock_controller = None
@@ -92,19 +134,35 @@ class ActionNavigationNode(Node):
         self.motion_task_metadata = {}
         self.grasp_handoff_active = False
         self.grasp_failure_hold = False
+        self.safe_stop_task_id = None
+        self.integrated_action = "IDLE"
+        self.integrated_action_started_at = 0.0
+        self.integrated_action_task_id = None
+        self.integrated_place_payload = None
         self.latest_pick_goal = None
         self.latest_pick_goal_time = 0.0
+        self.pick_goal_by_task = {}
         self.latest_task_status = None
         self.latest_task_status_time = 0.0
 
-        self.cmd_vel_pub = self.create_publisher(
-            Twist,
-            self.config.cmd_vel_topic,
-            10,
-        )
+        # Do not publish /cmd_vel directly.  The safety gateway is the sole
+        # final velocity publisher and receives this node's request stream.
+        self.cmd_vel_pub = SafeBaseCommandPublisher(self, self.config)
         self.ready_pub = self.create_publisher(
             String,
             self.config.ready_topic,
+            10,
+        )
+        # 总动作节点内部模拟抓取/放置的完成事件。独立 grasp/place
+        # executor 不再参与控制，避免出现多个节点争抢头腰关节。
+        self.grasp_status_pub = self.create_publisher(
+            String,
+            self.config.grasp_status_topic,
+            10,
+        )
+        self.place_status_pub = self.create_publisher(
+            String,
+            self.config.place_status_topic,
             10,
         )
 
@@ -138,10 +196,10 @@ class ActionNavigationNode(Node):
             self.on_grasp_command,
             10,
         )
-        self.grasp_status_sub = self.create_subscription(
+        self.place_command_sub = self.create_subscription(
             String,
-            self.config.grasp_status_topic,
-            self.on_grasp_status,
+            self.config.place_command_topic,
+            self.on_place_command,
             10,
         )
         self.pick_goal_sub = self.create_subscription(
@@ -217,6 +275,12 @@ class ActionNavigationNode(Node):
             )
             self.phase = phase
             self.phase_start_time = time.monotonic()
+        if phase == Phase.SAFE_STOP:
+            task = self.active_task or {}
+            task_id = task.get("task_id") if isinstance(task, dict) else None
+            if task_id is None and self.latest_pick_goal is not None:
+                task_id = self.latest_pick_goal.get("task_id")
+            self.safe_stop_task_id = task_id
 
     def on_scene(self, msg):
         try:
@@ -231,12 +295,17 @@ class ActionNavigationNode(Node):
         try:
             payload = json.loads(msg.data)
             source_stamp = payload.get("source_stamp") or {}
+            detection_objects = payload.get("detections") or []
+            detection_objects = self.fuse_shelf_memory_for_pick(
+                detection_objects,
+                payload.get("scene_memory") or {},
+            )
             self.latest_detection_seq += 1
             self.latest_detection_scene = {
                 "source_stamp_sec": source_stamp.get("sec"),
                 "source_stamp_nanosec": source_stamp.get("nanosec"),
                 "observation_seq": self.latest_detection_seq,
-                "objects": payload.get("detections") or [],
+                "objects": detection_objects,
             }
             self.latest_detection_time = time.monotonic()
             self.update_search_target_lock()
@@ -244,6 +313,88 @@ class ActionNavigationNode(Node):
             self.get_logger().warning(
                 f"解析grounded_sam检测失败: {error}"
             )
+
+    def fuse_shelf_memory_for_pick(self, detections, scene_memory):
+        """Repair only invalid shelf depth with same-frame shelf memory."""
+        pick_goal = self.fresh_pick_goal()
+        if not pick_goal:
+            return detections
+
+        expected_surface = str(
+            pick_goal.get("expected_source_surface") or ""
+        ).lower()
+        expected_label = str(
+            pick_goal.get("target_label") or ""
+        ).strip().lower()
+        if expected_surface != "shelf" or not expected_label:
+            return detections
+
+        memory_by_label = {
+            str(key).strip().lower(): value
+            for key, value in (
+                scene_memory.get("shelf_object_levels") or {}
+            ).items()
+            if isinstance(value, dict)
+        }
+        memory = memory_by_label.get(expected_label)
+        if memory is None:
+            return detections
+
+        memory_pose = memory.get("pose_world") or {}
+        if not all(axis in memory_pose for axis in ("x", "y", "z")):
+            return detections
+        shelf_bounds = self.config.shelf_target_bounds_xyz
+        memory_valid = all(
+            float(limits[0]) <= float(memory_pose[axis]) <= float(limits[1])
+            for axis, limits in zip(("x", "y", "z"), shelf_bounds)
+        )
+        if not memory_valid:
+            return detections
+
+        fused = []
+        for detection in detections:
+            label = str(
+                detection.get("corrected_label")
+                or detection.get("label")
+                or ""
+            ).strip().lower()
+            if label != expected_label:
+                fused.append(detection)
+                continue
+
+            pose = detection.get("pose_world") or {}
+            current_valid = all(
+                axis in pose
+                and float(limits[0])
+                <= float(pose[axis])
+                <= float(limits[1])
+                for axis, limits in zip(("x", "y", "z"), shelf_bounds)
+            )
+            if current_valid:
+                fused.append(detection)
+                continue
+
+            merged = dict(detection)
+            merged["pose_world"] = dict(memory_pose)
+            merged["support_surface"] = "shelf"
+            merged["on_shelf"] = True
+            merged["on_table"] = False
+            merged["shelf_layer"] = memory.get("layer")
+            merged["support_surface_index"] = memory.get(
+                "support_surface_index"
+            )
+            merged["shelf_layer_confidence"] = memory.get(
+                "confidence",
+                0.0,
+            )
+            merged["shelf_memory_fused"] = True
+            fused.append(merged)
+            self.get_logger().info(
+                "shelf memory fused: "
+                f"label={expected_label} pose={memory_pose}"
+            )
+
+        return fused
 
     def on_odom(self, msg):
         position = msg.pose.pose.position
@@ -286,8 +437,174 @@ class ActionNavigationNode(Node):
         command = msg.data.strip().lower()
         if command == "start" and self.phase == Phase.READY_FOR_GRASP:
             self.enter_grasp_handoff("grasp_start_command")
+            self.start_integrated_pick()
+        elif command in ("reset", "home_reset", "reset_pose"):
+            self.start_integrated_reset()
         elif command == "abort":
             self.exit_grasp_handoff("grasp_abort_command")
+
+    def on_place_command(self, msg):
+        try:
+            payload = json.loads(msg.data)
+        except json.JSONDecodeError:
+            payload = {"command": msg.data.strip().lower()}
+
+        command = str(payload.get("command") or "").lower()
+        if command == "start":
+            self.start_integrated_place(payload)
+        elif command == "abort":
+            self.integrated_action = "IDLE"
+            self.publish_integrated_status(
+                self.place_status_pub,
+                "place_aborted",
+                state="SAFE_STOP",
+            )
+
+    def publish_integrated_status(self, publisher, event, *, state=None, **extra):
+        payload = {
+            "event": event,
+            "state": state or self.integrated_action,
+            "time": time.time(),
+            "simulation": True,
+            "task_id": self.integrated_action_task_id,
+            **extra,
+        }
+        publisher.publish(
+            String(data=json.dumps(payload, ensure_ascii=False))
+        )
+        self.get_logger().info(
+            f"integrated action: {json.dumps(payload, ensure_ascii=False)}"
+        )
+
+    def start_integrated_pick(self):
+        if self.integrated_action != "IDLE":
+            return
+        self.integrated_action = "PICK_PREGRASP"
+        self.integrated_action_started_at = time.monotonic()
+        self.integrated_action_task_id = self.ready_task_id
+        self.publish_integrated_status(
+            self.grasp_status_pub,
+            "simulation_pick_started",
+            state="EXECUTE_PREGRASP",
+            target=self.ready_target_snapshot,
+        )
+
+    def start_integrated_place(self, payload):
+        if self.integrated_action != "IDLE":
+            self.publish_integrated_status(
+                self.place_status_pub,
+                "place_start_ignored",
+                state="BUSY",
+                reason=f"integrated action is {self.integrated_action}",
+            )
+            return
+        self.integrated_action = "PLACE_PREPLACE"
+        self.integrated_action_started_at = time.monotonic()
+        self.integrated_action_task_id = payload.get("task_id")
+        self.integrated_place_payload = payload
+        self.publish_integrated_status(
+            self.place_status_pub,
+            "place_started",
+            state="PREPLACE",
+            place_pose=payload.get("place_pose"),
+        )
+
+    def start_integrated_reset(self):
+        if self.integrated_action != "IDLE":
+            return
+        self.integrated_action = "RESET"
+        self.integrated_action_started_at = time.monotonic()
+        self.observer.stop()
+        self.navigator.stop()
+        self.visual_servo.stop(reset_stability=False)
+        self.integrated_action_task_id = self.ready_task_id
+        self.publish_integrated_status(
+            self.grasp_status_pub,
+            "reset_started",
+            state="RESETTING",
+        )
+
+    def advance_integrated_action(self):
+        if self.integrated_action == "IDLE":
+            return
+        stage_sec = float(
+            getattr(self.config, "grasp_simulation_stage_sec", 0.6)
+        )
+        if time.monotonic() - self.integrated_action_started_at < stage_sec:
+            if self.integrated_action == "RESET":
+                self.observer.publish_observe_pose(
+                    head_yaw=float(self.config.reset_head_yaw),
+                    head_pitch=float(self.config.reset_head_pitch),
+                    spine=float(self.config.reset_slide),
+                )
+            return
+
+        transitions = {
+            "PICK_PREGRASP": ("PICK_APPROACH", "approach", "EXECUTE_APPROACH"),
+            "PICK_APPROACH": ("PICK_HOLD", "hold", "EXECUTE_HOLD"),
+            "PICK_HOLD": ("PICK_LIFT", "lift", "EXECUTE_LIFT"),
+        }
+        if self.integrated_action in transitions:
+            next_action, stage, state = transitions[self.integrated_action]
+            self.integrated_action = next_action
+            self.integrated_action_started_at = time.monotonic()
+            self.publish_integrated_status(
+                self.grasp_status_pub,
+                "simulation_stage",
+                state=state,
+                stage=stage,
+            )
+            return
+
+        if self.integrated_action == "PICK_LIFT":
+            self.publish_integrated_status(
+                self.grasp_status_pub,
+                "lift_done_waiting_retreat",
+                state="LIFT_DONE",
+            )
+            self.integrated_action = "IDLE"
+            self.integrated_action_started_at = 0.0
+            return
+
+        place_transitions = {
+            "PLACE_PREPLACE": ("PLACE_RELEASE", "release", "APPROACH_PLACE"),
+            "PLACE_RELEASE": ("PLACE_RETREAT", "retreat", "RETREAT"),
+        }
+        if self.integrated_action in place_transitions:
+            next_action, stage, state = place_transitions[self.integrated_action]
+            self.integrated_action = next_action
+            self.integrated_action_started_at = time.monotonic()
+            self.publish_integrated_status(
+                self.place_status_pub,
+                "simulation_stage",
+                state=state,
+                stage=stage,
+            )
+            return
+
+        if self.integrated_action == "PLACE_RETREAT":
+            self.publish_integrated_status(
+                self.place_status_pub,
+                "place_done",
+                state="PLACE_DONE",
+            )
+            self.integrated_action = "IDLE"
+            self.integrated_action_started_at = 0.0
+            return
+
+        if self.integrated_action == "RESET":
+            self.observer.publish_observe_pose(
+                head_yaw=float(self.config.reset_head_yaw),
+                head_pitch=float(self.config.reset_head_pitch),
+                spine=float(self.config.reset_slide),
+            )
+            self.publish_integrated_status(
+                self.grasp_status_pub,
+                "reset_done",
+                state="WAIT_READY",
+            )
+            self.integrated_action = "IDLE"
+            self.integrated_action_started_at = 0.0
 
     def on_grasp_status(self, msg):
         try:
@@ -320,9 +637,25 @@ class ActionNavigationNode(Node):
 
         self.latest_pick_goal = payload
         self.latest_pick_goal_time = time.monotonic()
+        task_key = payload.get("task_id")
+        if task_key is not None:
+            self.pick_goal_by_task[str(task_key)] = dict(payload)
         if self.phase == Phase.SAFE_STOP:
             if self.grasp_failure_hold:
                 return
+
+            incoming_task_id = payload.get("task_id")
+            # task_executor 会周期性重发同一个 pick_goal。只有当它和
+            # 进入 SAFE_STOP 时记录的任务 ID 相同，才忽略这次重发。
+            # 不能再拿当前 scene 的 active_task_id 比较，因为视觉节点
+            # 可能已经切换到下一任务，导致真正的新任务被错误忽略。
+            if (
+                self.safe_stop_task_id is not None
+                and incoming_task_id is not None
+                and str(self.safe_stop_task_id) == str(incoming_task_id)
+            ):
+                return
+
             self.external_nav_goal_id = None
             self.external_nav_purpose = None
             self.current_goal = None
@@ -349,17 +682,105 @@ class ActionNavigationNode(Node):
             "WAIT_PICK_DONE",
         }
 
-    def fresh_pick_goal(self):
-        if self.latest_pick_goal is None:
+    def task_status_id(self):
+        """Return the task id owned by task_executor, if it is current."""
+        if not isinstance(self.latest_task_status, dict):
             return None
-        age = time.monotonic() - self.latest_pick_goal_time
-        if age > 3.0:
-            return None
-        return self.latest_pick_goal
+        task_id = self.latest_task_status.get("task_id")
+        return None if task_id is None else str(task_id)
 
-    def task_from_pick_goal(self, base_task):
+    def task_from_executor_contract(self):
+        """Build the pick task from task_executor, not stale VLM metadata."""
+        # /task/status may have more than one String publisher in the
+        # integrated stack.  A delayed publisher can therefore overwrite the
+        # callback cache with the previous task.  /task/pick_goal is emitted
+        # by task_executor immediately before/while waiting for this pick and
+        # carries the authoritative task id plus the target contract.
         pick_goal = self.fresh_pick_goal()
         if pick_goal is None:
+            return None
+
+        task_id = pick_goal.get("task_id")
+        if task_id is None:
+            return None
+
+        return self.task_from_pick_goal(
+            {
+                "task_id": str(task_id),
+                "original_instruction": pick_goal.get("raw_instruction"),
+                "target": {},
+            }
+        )
+
+    def target_matches_pick_contract(self, target):
+        """Reject a cached detection that belongs to another task."""
+        if not target:
+            return False
+
+        pick_goal = self.fresh_pick_goal()
+        if pick_goal is None:
+            return False
+
+        expected_label = str(
+            pick_goal.get("target_label") or ""
+        ).strip().lower()
+        actual_label = str(target.get("label") or "").strip().lower()
+        if expected_label and actual_label:
+            if (
+                expected_label not in actual_label
+                and actual_label not in expected_label
+            ):
+                return False
+
+        expected_color = str(
+            pick_goal.get("target_color") or ""
+        ).strip().lower()
+        actual_color = str(
+            target.get("estimated_color")
+            or target.get("color")
+            or ""
+        ).strip().lower()
+        if expected_color and actual_color and expected_color != actual_color:
+            return False
+
+        return True
+
+    def fresh_pick_goal(self, task_id=None):
+        candidate = self.latest_pick_goal
+        if task_id is not None:
+            candidate = self.pick_goal_by_task.get(str(task_id), candidate)
+        if candidate is None:
+            return None
+        if (
+            task_id is not None
+            and candidate.get("task_id") is not None
+            and str(candidate.get("task_id"))
+            != str(task_id)
+        ):
+            return None
+        # task_executor republishes this message while the task is waiting
+        # for pick.  Keep the last task-matched semantic contract available
+        # during a short publisher restart or a visual-node stall; the task ID
+        # check above prevents it from leaking into the next task.
+        if candidate is self.latest_pick_goal:
+            age = time.monotonic() - self.latest_pick_goal_time
+            if age > 30.0:
+                return None
+        return candidate
+
+    def task_from_pick_goal(self, base_task):
+        base_task_id = (
+            (base_task or {}).get("task_id")
+            if isinstance(base_task, dict)
+            else None
+        )
+        pick_goal = self.fresh_pick_goal(base_task_id)
+        if pick_goal is None:
+            if base_task_id is not None:
+                self.get_logger().warning(
+                    f"pick_goal missing for task_id={base_task_id}; "
+                    "keeping scene task source fields"
+                )
             return base_task
 
         task = dict(base_task or {})
@@ -663,6 +1084,173 @@ class ActionNavigationNode(Node):
             and table_yaw_error <= table_yaw_tolerance
         )
 
+    def task_expects_stacked_pick(self, task=None):
+        task = task or self.active_task or {}
+        instruction = str(
+            task.get("original_instruction")
+            or (self.latest_pick_goal or {}).get("raw_instruction")
+            or ""
+        )
+        pickup_clause = instruction.split("放到", 1)[0].lower()
+        return any(
+            marker in pickup_clause
+            for marker in (
+                "顶部",
+                "顶上",
+                "上面的",
+                "上方",
+                "on top",
+                "top of",
+            )
+        )
+
+    def stacked_target_lock_ready(self, target):
+        """Accept a task-matched top object clipped by the camera border."""
+        if not bool(
+            getattr(self.config, "stacked_target_lock_enable", True)
+        ):
+            return False
+        if not self.task_expects_stacked_pick():
+            return False
+        if not target or not self.target_is_table_target(target):
+            return False
+        if not self.target_matches_pick_contract(target):
+            return False
+        if not self.target_pose_valid_for_surface(target):
+            return False
+
+        box = target.get("box_xyxy") or []
+        centroid = target.get("centroid_uv") or []
+        if len(box) < 4 or len(centroid) < 2:
+            return False
+        x1, y1, x2, y2 = [float(value) for value in box[:4]]
+        width = max(0.0, x2 - x1)
+        height = max(0.0, y2 - y1)
+        area_ratio = (
+            width * height
+            / float(self.config.image_width * self.config.image_height)
+        )
+        border = float(
+            getattr(
+                self.config,
+                "stacked_target_lock_border_tolerance_px",
+                2.0,
+            )
+        )
+        clipped_at_one_vertical_edge = (
+            y1 <= border
+            or y2 >= float(self.config.image_height) - border
+        )
+        if not clipped_at_one_vertical_edge:
+            return False
+        if width < float(
+            getattr(
+                self.config,
+                "stacked_target_lock_min_visible_width_px",
+                80.0,
+            )
+        ):
+            return False
+        if height < float(
+            getattr(
+                self.config,
+                "stacked_target_lock_min_visible_height_px",
+                80.0,
+            )
+        ):
+            return False
+        if area_ratio > float(
+            getattr(
+                self.config,
+                "stacked_target_lock_max_area_ratio",
+                0.58,
+            )
+        ):
+            return False
+
+        dino_score = float(target.get("dino_score") or 0.0)
+        if dino_score < float(
+            getattr(
+                self.config,
+                "stacked_target_lock_min_dino_score",
+                0.40,
+            )
+        ):
+            return False
+
+        estimated_color = str(
+            target.get("estimated_color") or ""
+        ).strip().lower()
+        expected_color = str(
+            (self.fresh_pick_goal() or {}).get("target_color") or ""
+        ).strip().lower()
+        if not expected_color or estimated_color != expected_color:
+            return False
+        if target.get("color_consistent") is not True:
+            return False
+
+        if self.robot_pose is None or self.current_goal is None:
+            return False
+        goal_distance = self.navigator.distance_to_goal(
+            self.robot_pose,
+            self.current_goal,
+        )
+        goal_yaw_error = abs(
+            normalize_angle(
+                float(self.current_goal.yaw) - float(self.robot_pose.yaw)
+            )
+        )
+        return (
+            goal_distance
+            <= float(
+                getattr(
+                    self.config,
+                    "stacked_target_lock_goal_xy_tolerance_m",
+                    0.10,
+                )
+            )
+            and goal_yaw_error
+            <= float(
+                getattr(
+                    self.config,
+                    "stacked_target_lock_goal_yaw_tolerance_rad",
+                    0.16,
+                )
+            )
+            and self.close_range_lock_ready(target)
+        )
+
+    def shelf_memory_lock_ready(self, target):
+        """Allow a validated shelf-memory pose to survive a clipped view.
+
+        At a low shelf level the final camera view can crop the object at the
+        image edge.  The shelf pose comes from the scene memory and has
+        already passed the shelf workspace bounds, so requiring a second
+        complete RGB box here would discard the usable target after docking.
+        This exception is deliberately limited to shelf targets with the
+        explicit memory-fusion marker; table targets still require the normal
+        visual-servo geometry checks.
+        """
+        if not target or not bool(target.get("shelf_memory_fused")):
+            return False
+        if self.target_is_table_target(target):
+            return False
+        if not self.target_pose_valid_for_surface(target):
+            return False
+
+        box = target.get("box_xyxy") or []
+        if len(box) < 4:
+            return False
+        x1, y1, x2, y2 = [float(value) for value in box[:4]]
+        return (
+            x2 > 0.0
+            and y2 > 0.0
+            and x1 < float(self.config.image_width)
+            and y1 < float(self.config.image_height)
+            and x2 - x1 >= 12.0
+            and y2 - y1 >= 12.0
+        )
+
     def close_range_lock_target(self, preferred_target=None):
         candidates = (
             preferred_target,
@@ -674,12 +1262,17 @@ class ActionNavigationNode(Node):
         for candidate in candidates:
             if not candidate:
                 continue
+            if not self.target_matches_pick_contract(candidate):
+                continue
 
             target = dict(candidate)
             target = self.restore_motion_metadata(target)
             target = self.apply_pregrasp_metadata(target)
-            if self.close_range_lock_ready(target):
+            stacked_ready = self.stacked_target_lock_ready(target)
+            if self.close_range_lock_ready(target) or stacked_ready:
                 target["close_range_locked"] = True
+                if stacked_ready:
+                    target["stacked_target_locked"] = True
                 return target
 
         return None
@@ -934,9 +1527,16 @@ class ActionNavigationNode(Node):
         ):
             return
 
+        # 候选锁定也必须使用 task_executor 的当前 pick_goal。只在
+        # bind_current_task() 入口修正是不够的，因为这里每帧会再次从
+        # 滞后的 Qwen scene 绑定任务，第二任务会被重新变回 task_id=1。
+        base_task = self.task_from_executor_contract()
+        if base_task is None:
+            return
         task = bind_task_target_from_objects(
             self.latest_detection_scene,
-            self.task_from_pick_goal(get_active_task(self.latest_scene)),
+            base_task,
+            allow_partial_bbox=True,
         )
         observation_id = (
             self.latest_detection_scene.get("observation_seq"),
@@ -946,6 +1546,17 @@ class ActionNavigationNode(Node):
             area_name,
             observation_id,
         )
+        if task is not None:
+            candidate = task.get("target") or {}
+            self.get_logger().info(
+                "search candidate: "
+                f"area={area_name} label={candidate.get('label')} "
+                f"dino={candidate.get('dino_score')} "
+                f"color={candidate.get('estimated_color')} "
+                f"pose={candidate.get('pose_world')} "
+                f"valid_frames={self.search_target_lock.frame_count} "
+                f"rejection={self.search_target_lock.last_rejection_reason}"
+            )
         if confirmed_target is None:
             return
 
@@ -960,6 +1571,11 @@ class ActionNavigationNode(Node):
         task = dict(self.confirmed_search_task)
         task["target"] = confirmed_target
         return task
+
+    def clear_search_confirmation(self):
+        """Commit one search result so it cannot retrigger navigation."""
+        self.confirmed_search_task = None
+        self.search_target_lock.reset()
 
     def publish_ready(self, ready, reason):
         task = self.active_task or {}
@@ -1013,6 +1629,9 @@ class ActionNavigationNode(Node):
             "arm_clearance_ready": self.grasp_clearance_ready(target),
             "grasp_window_ready": self.grasp_window_ready(target),
             "close_range_locked": bool(target.get("close_range_locked")),
+            "stacked_target_locked": bool(
+                target.get("stacked_target_locked")
+            ),
             "close_range_lock_ready": self.close_range_lock_ready(target),
             "base_goal_pose": (
                 self.current_goal.__dict__
@@ -1114,6 +1733,7 @@ class ActionNavigationNode(Node):
         )
 
     def on_timer(self):
+        self.advance_integrated_action()
         if self.phase == Phase.WAIT_SCENE:
             self.handle_wait_scene()
         elif self.phase == Phase.SELECT_TASK:
@@ -1157,12 +1777,23 @@ class ActionNavigationNode(Node):
         perception_scene = (
             self.latest_detection_scene or self.latest_scene
         )
-        base_task = self.task_from_pick_goal(
-            get_active_task(self.latest_scene),
-        )
+        # Qwen 场景消息可能在任务完成切换后仍短暂保留上一条
+        # active_task_id。取物阶段的任务所有权在 task_executor，必须
+        # 优先使用同 task_id 的 /task/pick_goal，避免第二任务继续追踪
+        # 第一任务的目标。
+        base_task = self.task_from_executor_contract()
+        if base_task is None:
+            # 导航节点重启或任务刚切换时，视觉话题可能仍是上一条
+            # 场景。此时宁可等待新的 pick_goal，也不能回退到旧 scene。
+            if self.latest_pick_goal is None:
+                return None
+            base_task = self.task_from_pick_goal(
+                get_active_task(self.latest_scene),
+            )
         return bind_task_target_from_objects(
             perception_scene,
             base_task,
+            allow_partial_bbox=self.task_expects_stacked_pick(base_task),
         )
 
     def handle_select_task(self):
@@ -1201,6 +1832,7 @@ class ActionNavigationNode(Node):
                     self.latest_scene,
                     self.config,
                     robot_pose=self.robot_pose,
+                    active_task=self.active_task,
                 )
             except Exception as error:
                 self.get_logger().warning(
@@ -1279,11 +1911,36 @@ class ActionNavigationNode(Node):
         self.set_phase(Phase.NAVIGATE)
 
     def advance_search(self):
+        # 桌面目标使用左右两个安全站位覆盖视野，不在站位上原地大幅
+        # 旋转。大角度旋转会让相机短暂朝向墙面，也容易把桌边/墙面
+        # 的截断框误当成目标，随后导航到错误的工作区边缘。
+        current_area = self.current_search_area()
+        if current_area in (
+            "table_front",
+            "table_front_left",
+            "table_front_right",
+        ):
+            next_area = self.search_area_index + 1
+            if next_area < len(self.search_areas):
+                self.start_search_area(next_area)
+                return
+
+            self.navigator.stop()
+            self.publish_ready(False, "all_table_search_stations_exhausted")
+            self.set_phase(Phase.SAFE_STOP)
+            return
+
+        current_offsets = self.config.search_yaw_offsets
+        if current_area == "shelf_front":
+            current_offsets = getattr(
+                self.config,
+                "shelf_search_yaw_offsets",
+                (0.0,),
+            )
+
         self.search_yaw_index += 1
         self.search_turn_goal = None
-        if self.search_yaw_index < len(
-            self.config.search_yaw_offsets
-        ):
+        if self.search_yaw_index < len(current_offsets):
             self.observe_resume = True
             self.set_phase(Phase.SEARCH_ROTATE)
             return
@@ -1398,7 +2055,14 @@ class ActionNavigationNode(Node):
             )
             return
 
-        offset = self.config.search_yaw_offsets[
+        offsets = self.config.search_yaw_offsets
+        if self.current_search_area() == "shelf_front":
+            offsets = getattr(
+                self.config,
+                "shelf_search_yaw_offsets",
+                (0.0,),
+            )
+        offset = offsets[
             self.search_yaw_index
         ]
         target_yaw = self.search_center_yaw + float(offset)
@@ -1468,6 +2132,7 @@ class ActionNavigationNode(Node):
         confirmed_task = self.get_confirmed_search_task()
         if self.navigation_mode == "search" and confirmed_task is not None:
             self.active_task = confirmed_task
+            self.clear_search_confirmation()
             self.approach_retry_count = 0
             self.plan_approach_to_current_target(
                 "target_found_before_scan_replan_approach"
@@ -1567,6 +2232,7 @@ class ActionNavigationNode(Node):
             confirmed_task = self.get_confirmed_search_task()
             if self.navigation_mode == "search" and confirmed_task is not None:
                 self.active_task = confirmed_task
+                self.clear_search_confirmation()
                 self.observer.stop()
                 self.observe_resume = True
                 self.approach_retry_count = 0
@@ -1595,6 +2261,56 @@ class ActionNavigationNode(Node):
                 self.set_phase(Phase.VISUAL_SERVO)
                 return
 
+            # 近距离叠放目标可能仍有合并/贴边框，不能因此把底盘重新
+            # 派回新的导航点。只要世界位姿和抓取安全窗口已经满足，
+            # 直接锁定最后有效目标进入视觉伺服/预抓取。
+            if (
+                self.navigation_mode == "approach"
+                and fresh_target_detected
+                and (
+                    self.close_range_lock_ready(
+                        (self.active_task or {}).get("target") or {}
+                    )
+                    or self.stacked_target_lock_ready(
+                        (self.active_task or {}).get("target") or {}
+                    )
+                )
+            ):
+                target = dict((self.active_task or {}).get("target") or {})
+                target["close_range_locked"] = True
+                stacked_ready = self.stacked_target_lock_ready(target)
+                if stacked_ready:
+                    target["stacked_target_locked"] = True
+                self.active_task = dict(self.active_task or {})
+                self.active_task["target"] = target
+                self.observer.stop()
+                self.visual_servo.reset()
+                self.remember_servo_target(target)
+                self.publish_ready(False, "target_pose_ready_close_range_lock_servo")
+                self.set_phase(Phase.VISUAL_SERVO)
+                return
+
+            if (
+                self.navigation_mode == "approach"
+                and fresh_target_detected
+                and self.shelf_memory_lock_ready(
+                    (self.active_task or {}).get("target") or {}
+                )
+            ):
+                target = dict((self.active_task or {}).get("target") or {})
+                target["close_range_locked"] = True
+                self.active_task = dict(self.active_task or {})
+                self.active_task["target"] = target
+                self.observer.stop()
+                self.visual_servo.reset()
+                self.remember_servo_target(target)
+                self.publish_ready(
+                    False,
+                    "shelf_memory_pose_ready_close_range_lock_servo",
+                )
+                self.set_phase(Phase.VISUAL_SERVO)
+                return
+
         if fresh_target_detected:
             self.publish_ready(
                 False,
@@ -1615,18 +2331,6 @@ class ActionNavigationNode(Node):
                     "search_view_exhausted_rotate_to_next_view",
                 )
                 self.advance_search()
-                return
-
-            if (
-                fresh_target_detected
-                and self.approach_retry_count
-                < self.config.max_approach_retries
-            ):
-                self.approach_retry_count += 1
-                self.observe_resume = True
-                self.plan_approach_to_current_target(
-                    "target_cropped_backoff_and_replan_approach"
-                )
                 return
 
             reason = (
@@ -1710,7 +2414,10 @@ class ActionNavigationNode(Node):
                     self.active_task["target"] = locked_target
                     target = locked_target
                     close_range_locked = True
-                elif recent_target is None:
+                elif (
+                    recent_target is None
+                    or not self.target_matches_pick_contract(recent_target)
+                ):
                     self.visual_servo.stop()
                     self.publish_ready(
                         False,
@@ -1746,11 +2453,17 @@ class ActionNavigationNode(Node):
                     True,
                 )
             )
-            and self.close_range_lock_ready(target)
-            and self.grasp_clearance_ready(target)
+            and (
+                self.close_range_lock_ready(target)
+                or self.shelf_memory_lock_ready(target)
+                or self.stacked_target_lock_ready(target)
+            )
         ):
             close_range_locked = True
             target["close_range_locked"] = True
+            stacked_ready = self.stacked_target_lock_ready(target)
+            if stacked_ready:
+                target["stacked_target_locked"] = True
             self.active_task["target"] = target
 
         if close_range_locked:
@@ -1833,6 +2546,12 @@ class ActionNavigationNode(Node):
         )
 
         self.pregrasp_start_spine = current_spine
+        self.pregrasp_commanded_spine = current_spine
+        self.pregrasp_commanded_head_pitch = (
+            float(self.head_pitch_position)
+            if self.head_pitch_position is not None
+            else float(self.config.table_pregrasp_head_pitch)
+        )
         estimated_spine = self.estimate_pregrasp_spine_from_target(
             target
         )
@@ -2046,36 +2765,52 @@ class ActionNavigationNode(Node):
             )
 
             # 腰部目标：朝 expected_spine 小步移动，避免一下子丢视野。
-        spine_error = float(expected_spine) - current_spine
-        spine_step = max(
+        # 预抓取采用单阶段写入：先让腰部到位，腰部反馈进入容差后，
+        # 再让头部收敛。这样不会在同一个控制周期同时追两个有延迟的
+        # 位置反馈，避免头腰设定点互相拉扯造成抽搐。
+        commanded_spine = (
+            float(self.pregrasp_commanded_spine)
+            if self.pregrasp_commanded_spine is not None
+            else current_spine
+        )
+        spine_error = float(expected_spine) - commanded_spine
+        spine_ready_now = (
+            abs(spine_error)
+            <= self.config.pregrasp_spine_target_tolerance
+        )
+        if not spine_ready_now:
+            spine_step = max(
                 -self.config.pregrasp_spine_step,
                 min(self.config.pregrasp_spine_step, spine_error),
             )
-        next_spine = current_spine + spine_step
-
-            # 头部目标：如果目标在画面偏下，头回正；如果目标偏上，稍微低头。
-            # 注意：你当前系统里 pitch 越接近 0 越回正，-0.65 更俯视。
-        head_error = float(target_head) - current_head
-        head_step = max(
-            -self.config.pregrasp_head_pitch_step,
-            min(self.config.pregrasp_head_pitch_step, head_error),
-        )
-        next_head = current_head + head_step
-
-        # 预抓取阶段不再根据目标 v 坐标额外回正头部。
-        # 近距离时方块容易贴近画面下沿，继续回正会把目标推出视野；
-        # 这里让 head_pitch 严格收敛到配置里的 pregrasp_final_head_pitch。
+            next_spine = commanded_spine + spine_step
+            next_head = float(self.pregrasp_commanded_head_pitch)
+        else:
+            next_spine = float(self.pregrasp_commanded_spine)
+            commanded_head = (
+                float(self.pregrasp_commanded_head_pitch)
+                if self.pregrasp_commanded_head_pitch is not None
+                else current_head
+            )
+            head_error = float(target_head) - commanded_head
+            head_step = max(
+                -self.config.pregrasp_head_pitch_step,
+                min(self.config.pregrasp_head_pitch_step, head_error),
+            )
+            next_head = commanded_head + head_step
 
         next_head = max(
-                self.config.pregrasp_head_pitch_min,
-                min(self.config.pregrasp_head_pitch_max, next_head),
-            )
+            self.config.pregrasp_head_pitch_min,
+            min(self.config.pregrasp_head_pitch_max, next_head),
+        )
+        self.pregrasp_commanded_spine = float(next_spine)
+        self.pregrasp_commanded_head_pitch = float(next_head)
 
         self.observer.publish_observe_pose(
-                head_yaw=0.0,
-                head_pitch=next_head,
-                spine=next_spine,
-            )
+            head_yaw=0.0,
+            head_pitch=self.pregrasp_commanded_head_pitch,
+            spine=self.pregrasp_commanded_spine,
+        )
 
         if pregrasp_view_ready:
             self.pregrasp_last_safe_spine = next_spine
@@ -2194,9 +2929,10 @@ class ActionNavigationNode(Node):
             self.publish_ready(True, "grasp_handoff_active_ready_kept")
             return
 
-        current_task = self.task_from_pick_goal(
-            get_active_task(self.latest_scene or {}),
-        )
+        # ready 锁存校验也必须使用 task_executor 的当前 pick_goal。
+        # Qwen 的 scene_understanding 可能仍带上一任务的 task_id，不能
+        # 因此清掉已经对准的新目标。
+        current_task = self.task_from_executor_contract()
         current_task_id = (
             current_task.get("task_id")
             if current_task is not None
@@ -2313,11 +3049,14 @@ def main():
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        node.navigator.stop()
+        if rclpy.ok():
+            node.navigator.stop()
     finally:
-        node.navigator.stop()
+        if rclpy.ok():
+            node.navigator.stop()
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":

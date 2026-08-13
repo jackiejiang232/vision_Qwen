@@ -118,6 +118,38 @@ class ActiveObserver:
         self.active = False
         self.current_view_name = None
 
+    def _pose_settled(self, head_pitch, spine):
+        """Wait for the commanded observation height before sampling vision."""
+        tolerance = float(
+            getattr(self.config, "observe_pose_settle_tolerance", 0.035)
+        )
+        node = self.node
+
+        spine_actual = getattr(node, "spine_position", None)
+        head_actual = getattr(node, "head_pitch_position", None)
+        spine_age = time.monotonic() - float(
+            getattr(node, "spine_state_time", 0.0)
+        )
+        head_age = time.monotonic() - float(
+            getattr(node, "head_state_time", 0.0)
+        )
+
+        spine_ready = (
+            spine_actual is None
+            or (
+                spine_age <= float(self.config.spine_state_max_age_sec)
+                and abs(float(spine_actual) - float(spine)) <= tolerance
+            )
+        )
+        head_ready = (
+            head_actual is None
+            or (
+                head_age <= float(self.config.head_state_max_age_sec)
+                and abs(float(head_actual) - float(head_pitch)) <= tolerance
+            )
+        )
+        return spine_ready and head_ready
+
     def step(self):
         """
         返回 True 表示整套观察动作已经扫完。
@@ -149,7 +181,17 @@ class ActiveObserver:
         )
 
         elapsed = time.monotonic() - self.pose_start_time
-        if elapsed >= hold_sec:
+        settle_timeout = float(
+            getattr(
+                self.config,
+                "observe_pose_settle_timeout_sec",
+                1.2,
+            )
+        )
+        pose_settled = self._pose_settled(head_pitch, spine)
+        if elapsed >= hold_sec and (
+            pose_settled or elapsed >= hold_sec + settle_timeout
+        ):
             self.index += 1
             self.pose_start_time = time.monotonic()
 

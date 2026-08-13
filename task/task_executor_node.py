@@ -58,10 +58,13 @@ class TaskExecutorNode(Node):
         self.last_command_time = 0.0
         self.last_reference_query_time = 0.0
         self.last_pick_query_time = 0.0
+        self.pick_command_time = 0.0
+        self.place_command_time = 0.0
         self.reset_command_time = 0.0
         self.last_official_instruction = None
         self.last_official_instruction_rx = 0.0
         self.official_task_queue = []
+        self.official_task_batch = []
         self.official_completed_task_ids = set()
         self.official_batch_signature = None
         self.initial_object_memory = {}
@@ -97,28 +100,35 @@ class TaskExecutorNode(Node):
 
     def on_task_command(self, message):
         self.official_task_queue = []
+        self.official_task_batch = []
+        self.official_completed_task_ids = set()
+        self.official_batch_signature = None
         self.start_task_from_instruction(message.data, source="manual", force=True)
 
     def on_official_instruction(self, message):
         instruction = str(message.data).strip()
         if not instruction:
             return
-        if self.task_is_active():
-            self.publish_task_status("official_instruction_ignored_task_running")
-            return
-
         tasks = parse_official_task_commands(instruction)
+        if not tasks:
+            return
         signature = self.official_signature(tasks)
         if signature != self.official_batch_signature:
             self.official_batch_signature = signature
+            self.official_task_batch = list(tasks)
             self.official_completed_task_ids = set()
             self.initial_object_memory = {}
+        elif not self.official_task_batch:
+            # 兼容节点重启后收到的重复官方消息。
+            self.official_task_batch = list(tasks)
 
-        pending = [
-            task
-            for task in tasks
-            if str(task.get("task_id")) not in self.official_completed_task_ids
-        ]
+        if self.task_is_active():
+            # 官方端可能会周期性重复发布完整任务列表。任务执行期间只
+            # 更新批次缓存，不要打断当前任务，也不要把任务一重新启动。
+            self.publish_task_status("official_instruction_cached_task_running")
+            return
+
+        pending = self.pending_official_tasks()
         if not pending:
             if self.task_ctx is not None:
                 self.publish_task_status("official_instruction_ignored_all_tasks_done")
@@ -133,8 +143,16 @@ class TaskExecutorNode(Node):
             return
         self.last_official_instruction = instruction
         self.last_official_instruction_rx = now
-        self.official_task_queue = list(pending[1:])
         self.start_parsed_task(pending[0], source="official")
+
+    def pending_official_tasks(self):
+        """Return the unfinished official tasks in their original order."""
+        batch = self.official_task_batch or self.official_task_queue
+        return [
+            task
+            for task in batch
+            if str(task.get("task_id")) not in self.official_completed_task_ids
+        ]
 
     def task_is_active(self):
         if self.task_ctx is None:
@@ -275,7 +293,7 @@ class TaskExecutorNode(Node):
         payload["time"] = time.time()
         payload["pending_nav_goal_id"] = self.pending_nav_goal_id
         payload["latest_navigation_status"] = self.latest_nav_status
-        payload["official_queue_remaining"] = len(self.official_task_queue)
+        payload["official_queue_remaining"] = len(self.pending_official_tasks())
         payload["official_completed_task_ids"] = sorted(self.official_completed_task_ids)
         self.publish_json(self.task_status_pub, payload)
 
@@ -329,6 +347,16 @@ class TaskExecutorNode(Node):
         if "货架" in pickup_clause or "shelf" in pickup_clause:
             return "shelf"
         if "桌" in pickup_clause or "table" in pickup_clause:
+            return "table"
+        # Some official instructions describe a tabletop object through its
+        # support object, for example "白色正方体顶部的褐色方块".  The
+        # support object is on the table, so this is a table search rather
+        # than the default shelf search.  Keep this inference restricted to
+        # the pickup clause; words after "放到" describe the destination.
+        if any(
+            marker in pickup_clause
+            for marker in ("顶部", "顶上的", "上面的", "上方的", "上面")
+        ):
             return "table"
         return None
 
@@ -616,6 +644,8 @@ class TaskExecutorNode(Node):
 
     def send_grasp_command(self, command):
         # grasp_executor_node 当前接收纯文本命令，例如 "start"。
+        if command == "start":
+            self.pick_command_time = time.time()
         msg = String()
         msg.data = str(command)
         self.grasp_command_pub.publish(msg)
@@ -658,6 +688,8 @@ class TaskExecutorNode(Node):
         )
 
     def send_place_command(self, command):
+        if command == "start":
+            self.place_command_time = time.time()
         self.publish_json(
             self.place_command_pub,
             {
@@ -774,13 +806,23 @@ class TaskExecutorNode(Node):
 
     def grasp_done(self):
         status = self.latest_grasp_status or {}
+        if float(status.get("time") or 0.0) < self.pick_command_time:
+            return False
         event = str(status.get("event") or "").lower()
         state = str(status.get("state") or "").upper()
-        return event in ("lift_done_waiting_retreat", "grasp_done", "done") or state in ("DONE", "LIFT_DONE")
+        return (
+            event in ("lift_done_waiting_retreat", "grasp_done", "done")
+            or state in ("DONE", "LIFT_DONE")
+        )
 
     def place_done(self):
         status = self.latest_place_status or {}
-        return status.get("state") == "PLACE_DONE" or status.get("event") == "place_done"
+        if float(status.get("time") or 0.0) < self.place_command_time:
+            return False
+        return (
+            status.get("state") == "PLACE_DONE"
+            or status.get("event") == "place_done"
+        )
 
     def reset_done(self):
         status = self.latest_grasp_status or {}
@@ -976,8 +1018,9 @@ class TaskExecutorNode(Node):
                 self.task_done_reported = True
                 self.official_completed_task_ids.add(str(self.task_ctx.task_id))
                 self.publish_task_status("task_done")
-            if self.official_task_queue:
-                next_task = self.official_task_queue.pop(0)
+            pending = self.pending_official_tasks()
+            if pending:
+                next_task = pending[0]
                 self.start_parsed_task(next_task, source="official_queue")
             return
 

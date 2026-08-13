@@ -483,10 +483,17 @@ def run_sam(
         best_index = torch.argmax(mask_scores[0])
 
         best_mask = masks[0, best_index]
+        best_mask_numpy = best_mask.detach().cpu().numpy().astype(bool)
+        if target_label:
+            best_mask_numpy = refine_mask_for_target_color(
+                image_bgr,
+                best_mask_numpy,
+                target_label,
+            )
         best_score = mask_scores[0, best_index]
 
         all_masks.append(
-            best_mask.detach().cpu().numpy()
+            best_mask_numpy
         )
         all_scores.append(
             float(best_score.detach().cpu())
@@ -606,78 +613,79 @@ def expected_color_from_label(label):
     return None
 
 
+KNOWN_COLORS = ("pink", "brown", "yellow", "white")
+
+
 def color_consistent(label, estimated_color):
     expected = expected_color_from_label(label)
     if expected is None:
         return True
     return estimated_color == expected
 
-def estimate_mask_color(image_bgr, mask, label=None):
+
+def estimate_color_scores(image_bgr, mask):
+    """Return HSV evidence ratios without changing the existing thresholds."""
     if mask is None or mask.sum() == 0:
-        return None
+        return {}
 
     mask_bool = mask.astype(np.uint8)
-
     kernel = np.ones((5, 5), np.uint8)
     mask_bool = cv2.erode(mask_bool, kernel, iterations=1).astype(bool)
-
     pixels = image_bgr[mask_bool]
-
     if len(pixels) == 0:
-        return None
+        return {}
 
     hsv = cv2.cvtColor(
         pixels.reshape(-1, 1, 3),
         cv2.COLOR_BGR2HSV,
     ).reshape(-1, 3)
-
     hue = hsv[:, 0]
     sat = hsv[:, 1]
     val = hsv[:, 2]
-
     valid = val > 40
     hue = hue[valid]
     sat = sat[valid]
     val = val[valid]
-
     if len(hue) == 0:
+        return {}
+
+    return {
+        "pink": float(np.mean(
+            (
+                ((hue >= 145) & (hue <= 179))
+                | ((hue >= 0) & (hue <= 5))
+            )
+            & (sat > 35)
+            & (val > 120)
+        )),
+        "yellow": float(np.mean(
+            (hue >= 18)
+            & (hue <= 42)
+            & (sat > 40)
+            & (val > 120)
+        )),
+        "brown": float(np.mean(
+            (hue >= 5)
+            & (hue < 18)
+            & (sat > 25)
+            & (val >= 70)
+            & (val < 230)
+        )),
+        "white": float(np.mean(
+            (sat < 35)
+            & (val > 160)
+        )),
+    }
+
+
+def estimate_mask_color(image_bgr, mask, label=None):
+    scores = estimate_color_scores(image_bgr, mask)
+    if not scores:
         return None
 
-    pink_ratio = np.mean(
-        (
-            ((hue >= 145) & (hue <= 179))
-            | ((hue >= 0) & (hue <= 5))
-        )
-        & (sat > 35)
-        & (val > 120)
-    )
-
-    yellow_ratio = np.mean(
-        (hue >= 18)
-        & (hue <= 42)
-        & (sat > 40)
-        & (val > 120)
-    )
-
-    brown_ratio = np.mean(
-        (hue >= 5)
-        & (hue < 18)
-        & (sat > 25)
-        & (val >= 70)
-        & (val < 230)
-    )
-
-    white_ratio = np.mean(
-        (sat < 35)
-        & (val > 160)
-    )
-
-    scores = {
-        "pink": pink_ratio,
-        "yellow": yellow_ratio,
-        "brown": brown_ratio,
-        "white": white_ratio,
-    }
+    pink_ratio = scores["pink"]
+    yellow_ratio = scores["yellow"]
+    brown_ratio = scores["brown"]
     if yellow_ratio > 0.10 and yellow_ratio >= brown_ratio * 0.7:
         return "yellow"
 
@@ -761,6 +769,73 @@ def get_color_prompt_points(image_bgr, box_xyxy, label):
 
     return np.array([[point_x, point_y]], dtype=np.float32), np.array([1], dtype=np.int32)
 
+
+def target_color_mask(image_bgr, label):
+    """Return the existing HSV color mask for a task target."""
+    label_lower = str(label or "").lower()
+    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+
+    if "yellow" in label_lower:
+        return (
+            (hsv[:, :, 0] >= 20)
+            & (hsv[:, :, 0] <= 38)
+            & (hsv[:, :, 1] > 50)
+        )
+    if "pink" in label_lower:
+        return (
+            ((hsv[:, :, 0] >= 140) | (hsv[:, :, 0] <= 10))
+            & (hsv[:, :, 1] > 30)
+        )
+    if "brown" in label_lower:
+        return (
+            (hsv[:, :, 0] >= 6)
+            & (hsv[:, :, 0] <= 25)
+            & (hsv[:, :, 1] > 25)
+            & (hsv[:, :, 2] >= 80)
+            & (hsv[:, :, 2] < 230)
+        )
+    return None
+
+
+def refine_mask_for_target_color(image_bgr, mask, label):
+    """Trim a merged stacked-object mask to the requested object color.
+
+    The HSV thresholds are intentionally the same ones already used by the
+    project. This only changes the SAM mask and therefore the bbox/pose made
+    from it; it does not relabel detections or alter color classification.
+    """
+    color_mask = target_color_mask(image_bgr, label)
+    if color_mask is None:
+        return mask.astype(bool)
+
+    original = mask.astype(bool)
+    candidate = original & color_mask
+    original_area = int(original.sum())
+    candidate_area = int(candidate.sum())
+    if candidate_area < 20 or candidate_area < max(20, int(original_area * 0.08)):
+        return original
+
+    candidate_u8 = candidate.astype(np.uint8)
+    kernel = np.ones((9, 9), dtype=np.uint8)
+    candidate_u8 = cv2.morphologyEx(
+        candidate_u8,
+        cv2.MORPH_CLOSE,
+        kernel,
+        iterations=2,
+    )
+    component_count, component_labels, stats, _ = cv2.connectedComponentsWithStats(
+        candidate_u8,
+        connectivity=8,
+    )
+    if component_count <= 1:
+        return candidate_u8.astype(bool)
+
+    largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    refined = component_labels == largest
+    if int(refined.sum()) < max(20, int(candidate_area * 0.35)):
+        return candidate
+    return refined
+
 def depth_consistency(depth_image, mask):
     if depth_image is None or mask is None or mask.sum() == 0:
         return None
@@ -776,6 +851,78 @@ def depth_consistency(depth_image, mask):
     p90 = np.percentile(values, 90)
 
     return float((p90 - p10) / 1000.0)
+
+
+def _box_region_mask(box, height, width):
+    """Return a pixel mask for one original DINO box."""
+    x1, y1, x2, y2 = [float(value) for value in box]
+    left = max(0, min(width - 1, int(np.floor(x1))))
+    top = max(0, min(height - 1, int(np.floor(y1))))
+    right = max(left + 1, min(width, int(np.ceil(x2))))
+    bottom = max(top + 1, min(height, int(np.ceil(y2))))
+    region = np.zeros((height, width), dtype=bool)
+    region[top:bottom, left:right] = True
+    return region
+
+
+def _choose_detection_geometry(mask, dino_box, image_bgr, label):
+    """Keep SAM for clean masks and fall back to DINO for merged masks.
+
+    At close range a shelf board can be connected to the requested box by
+    SAM.  The resulting mask then touches an image edge and its depth median
+    describes the board instead of the box.  Restricting the mask to the
+    original DINO box preserves the detector's object hypothesis and keeps
+    all existing color thresholds unchanged.
+    """
+    height, width = image_bgr.shape[:2]
+    original_mask = mask.astype(bool)
+    mask_box = mask_bbox(original_mask)
+    dino_box = [float(value) for value in dino_box]
+    dino_width = max(0.0, dino_box[2] - dino_box[0])
+    dino_height = max(0.0, dino_box[3] - dino_box[1])
+    dino_area = dino_width * dino_height
+    mask_area = float(original_mask.sum())
+    mask_box_area = 0.0
+    if mask_box is not None:
+        mask_box_area = max(0.0, mask_box[2] - mask_box[0]) * max(
+            0.0,
+            mask_box[3] - mask_box[1],
+        )
+
+    mask_touches_edge = bool(
+        mask_box
+        and (
+            mask_box[0] <= 1.0
+            or mask_box[1] <= 1.0
+            or mask_box[2] >= float(width - 2)
+            or mask_box[3] >= float(height - 2)
+        )
+    )
+    dino_is_interior = (
+        dino_box[0] >= 4.0
+        and dino_box[1] >= 4.0
+        and dino_box[2] <= float(width - 4)
+        and dino_box[3] <= float(height - 4)
+    )
+    merged_with_background = (
+        mask_box_area > max(1.8 * dino_area, 0.55 * width * height)
+        or (mask_touches_edge and dino_is_interior)
+    )
+    if not merged_with_background:
+        return original_mask, dino_box, "sam_mask"
+
+    dino_region = _box_region_mask(dino_box, height, width)
+    fallback = original_mask & dino_region
+    color_mask = target_color_mask(image_bgr, label)
+    if color_mask is not None:
+        color_fallback = color_mask & dino_region
+        if int(color_fallback.sum()) >= max(20, int(fallback.sum() * 0.08)):
+            fallback = color_fallback
+
+    if int(fallback.sum()) < 20:
+        return original_mask, dino_box, "sam_mask_unusable_fallback"
+
+    return fallback, dino_box, "dino_box_fallback"
 
 def create_detection_records(
     boxes_xyxy,
@@ -793,17 +940,27 @@ def create_detection_records(
 
     for index, box in enumerate(boxes_numpy):
         mask = masks[index]
+        geometry_mask, geometry_box, geometry_source = (
+            _choose_detection_geometry(
+                mask=mask,
+                dino_box=box.tolist(),
+                image_bgr=image_bgr,
+                label=phrases[index],
+            )
+            if image_bgr is not None
+            else (mask.astype(bool), box.tolist(), "sam_mask")
+        )
         estimated_color = (
             estimate_mask_color(
                 image_bgr,
-                mask,
+                geometry_mask,
                 label=phrases[index],
             )
             if image_bgr is not None
             else None
         )
-        mask_centroid_uv = mask_centroid(mask)
-        box_values = [float(value) for value in box.tolist()]
+        mask_centroid_uv = mask_centroid(geometry_mask)
+        box_values = [float(value) for value in geometry_box]
         box_width = max(0.0, box_values[2] - box_values[0])
         box_height = max(0.0, box_values[3] - box_values[1])
         bbox_centroid_uv = [
@@ -831,13 +988,13 @@ def create_detection_records(
         if depth_image is not None and intrinsics is not None:
             pose_camera = build_pose_camera_from_detection(
                 depth_image=depth_image,
-                mask=mask,
+                mask=geometry_mask,
                 centroid_uv=center_uv,
                 intrinsics=intrinsics,
-    )
+            )
             size_3d = estimate_box_size_from_mask_depth(
                 depth_image=depth_image,
-                mask=mask,
+                mask=geometry_mask,
                 intrinsics=intrinsics,
             )
         records.append(
@@ -847,15 +1004,16 @@ def create_detection_records(
                 "raw_label": phrases[index],
                 "corrected_label": corrected_label,
                 "estimated_color": estimated_color,
+                "color_scores": estimate_color_scores(image_bgr, mask),
                 "color_consistent": color_consistent(
                     phrases[index],
                     estimated_color,
                 ),
-                "depth_span_m": depth_consistency(depth_image, mask),
+                "depth_span_m": depth_consistency(depth_image, geometry_mask),
                 "dino_score": float(logits[index]),
                 "sam_score": float(mask_scores[index]),
-                "box_xyxy": mask_bbox(mask) or box.tolist(),
-                "mask_area": int(mask.sum()),
+                "box_xyxy": geometry_box,
+                "mask_area": int(geometry_mask.sum()),
                 "centroid_uv": center_uv,
                 "mask_centroid_uv": mask_centroid_uv,
                 "bbox_centroid_uv": bbox_centroid_uv,
@@ -868,11 +1026,104 @@ def create_detection_records(
                 "pose_camera": pose_camera,
                 "pose_world": None,
                 "size_3d": size_3d,
+                "geometry_source": geometry_source,
             }
         
         )
 
     return records
+
+
+def target_candidate_indices(records, target_label):
+    """Keep only candidates that agree with a task-specific pick query."""
+    target = str(target_label or "").lower()
+    expected_color = expected_color_from_label(target)
+    target_is_box = any(
+        word in target for word in ("box", "cube", "cuboid", "block")
+    )
+    target_shape = next(
+        (
+            word
+            for word in ("box", "cube", "cuboid", "cylinder")
+            if word in target
+        ),
+        None,
+    )
+
+    selected = []
+    for index, record in enumerate(records):
+        label = str(
+            record.get("corrected_label")
+            or record.get("label")
+            or record.get("raw_label")
+            or ""
+        ).lower()
+        estimated_color = str(
+            record.get("estimated_color") or ""
+        ).lower()
+
+        if expected_color and expected_color not in label:
+            continue
+        if expected_color == "brown":
+            # 棕色箱在货架灯光下常被估成 yellow/unknown。仍要求 DINO
+            # 语义标签是 brown box，但允许存在明确的 brown 像素证据。
+            scores = record.get("color_scores") or {}
+            brown_score = float(scores.get("brown") or 0.0)
+            yellow_score = float(scores.get("yellow") or 0.0)
+            support_surface = str(
+                record.get("support_surface") or ""
+            ).lower()
+            on_shelf = bool(record.get("on_shelf")) or support_surface in (
+                "shelf",
+                "shelf_candidate",
+            )
+            dino_score = float(record.get("dino_score") or 0.0)
+            strong_yellow_without_brown = (
+                estimated_color == "yellow"
+                and yellow_score >= 0.55
+                and brown_score < 0.04
+            )
+            brown_like = (
+                estimated_color == "brown"
+                or brown_score >= 0.04
+                or (
+                    on_shelf
+                    and
+                    estimated_color in ("yellow", "unknown", "")
+                    and dino_score >= 0.40
+                    and not strong_yellow_without_brown
+                )
+            )
+            if not brown_like:
+                continue
+        elif expected_color:
+            # 任务已经通过精确 DINO 查询锁定了目标词（例如 pink box）。
+            # 近距离货架灯光/阴影下浅粉色常被 HSV 估成 white，
+            # 所以“白/未知”属于不确定证据，不能单独否决语义命中。
+            # 只有明确的其他彩色证据才拒绝，避免白色货架板进入结果。
+            color_scores = record.get("color_scores") or {}
+            contradictory_score = max(
+                float(color_scores.get(color) or 0.0)
+                for color in KNOWN_COLORS
+                if color != expected_color
+            )
+            contradictory_color = (
+                estimated_color
+                and estimated_color != expected_color
+                and estimated_color != "white"
+                and estimated_color != "unknown"
+            )
+            if contradictory_color and contradictory_score >= 0.45:
+                continue
+        if target_is_box and not any(
+            word in label for word in ("box", "cube", "cuboid", "block")
+        ):
+            continue
+        if target_shape and target_shape not in label:
+            continue
+        selected.append(index)
+
+    return selected
 
 
 def create_visualization(
@@ -1356,9 +1607,16 @@ class GroundedSamCameraNode(Node):
                 if targeted_pick_query
                 else self.args.text_threshold
             )
-            # 抓取阶段使用任务目标的精确短语作为 GroundingDINO 的实际
-            # caption。任务节点仍保留对比词元数据，但不让其他颜色类别
-            # 抢占候选框，避免黄色箱被标成 pink、背景被标成 yellow。
+            if targeted_pick_query and expected_color_from_label(
+                query_target_label
+            ) == "brown":
+                # 棕色箱在货架阴影/暖光下 DINO 分数通常低于桌面目标；
+                # 只放宽棕色目标的候选门槛，后续仍经过语义和颜色证据过滤。
+                box_threshold = min(box_threshold, 0.24)
+                text_threshold = min(text_threshold, 0.18)
+            # 目标查询优先用精确短语，避免货架/桌面等对比词把目标
+            # 的 GroundingDINO 分数压低。叠放拆分由颜色掩膜完成，
+            # 候选仍会经过 target_candidate_indices 严格过滤。
             inference_prompt = (
                 f"{query_target_label} ."
                 if targeted_pick_query
@@ -1378,9 +1636,7 @@ class GroundedSamCameraNode(Node):
                 box_threshold=box_threshold,
                 text_threshold=text_threshold,
                 device=self.device,
-                target_label=(
-                    query_target_label if targeted_pick_query else None
-                ),
+                target_label=(query_target_label if targeted_pick_query else None),
             )
 
             inference_ms = (
@@ -1424,6 +1680,39 @@ class GroundedSamCameraNode(Node):
                 record["contract_ready"] = len(missing) == 0
                 record["contract_missing"] = missing
 
+            raw_record_count = len(records)
+            display_boxes = np.asarray(
+                [
+                    record.get("box_xyxy") or boxes_xyxy[index].tolist()
+                    for index, record in enumerate(records)
+                ],
+                dtype=np.float32,
+            ).reshape((-1, 4))
+            display_masks = masks
+            display_logits = logits
+            display_phrases = [
+                record.get("corrected_label") or record.get("label")
+                for record in records
+            ]
+
+            # 任务抓取查询只保留语义和实际颜色都一致的候选。
+            # 未通过的候选不进入scene_memory、不发给导航，也不画框。
+            if targeted_pick_query:
+                selected_indices = target_candidate_indices(
+                    records,
+                    query_target_label,
+                )
+                records = [records[index] for index in selected_indices]
+                display_boxes = display_boxes[selected_indices]
+                display_masks = masks[selected_indices]
+                display_logits = logits[selected_indices]
+                display_phrases = [
+                    display_phrases[index]
+                    for index in selected_indices
+                ]
+
+            filtered_record_count = len(records)
+
             if header is not None:
                     frame_key = (
                         f"{header.stamp.sec}_"
@@ -1464,16 +1753,12 @@ class GroundedSamCameraNode(Node):
                     record["yaw_std_rad"] = None
 
             self.scene_memory.update_from_detections(records)
-            display_phrases = [
-                record.get("corrected_label") or record.get("label")
-                for record in records
-            ]
             annotated = create_visualization(
                 image_bgr=frame,
-                boxes=boxes_xyxy.cpu().numpy(),
-                masks=masks,
+                boxes=display_boxes,
+                masks=display_masks,
                 phrases=display_phrases,
-                logits=logits,
+                logits=display_logits,
             )
 
             self.publish_detection_result(
@@ -1503,6 +1788,8 @@ class GroundedSamCameraNode(Node):
             self.processed_sequence = sequence
             self.get_logger().info(
                 f"检测目标={len(records)}，"
+                f"原始候选={raw_record_count}，"
+                f"过滤后={filtered_record_count}，"
                 f"推理耗时={inference_ms:.1f} ms"
             )
 

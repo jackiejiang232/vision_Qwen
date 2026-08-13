@@ -60,6 +60,27 @@ class SearchTargetLock:
             return self.get_confirmed()
 
         target = copy.deepcopy((task or {}).get("target") or {})
+        task_specific = bool(
+            target.get("label")
+            and target.get("color")
+            and target.get("category")
+            and (
+                target.get("support_surface")
+                or target.get("source_location")
+            )
+        )
+        required_frames = int(self.config.search_target_confirm_frames)
+        if task_specific:
+            required_frames = min(
+                required_frames,
+                int(
+                    getattr(
+                        self.config,
+                        "search_target_confirm_frames_task",
+                        required_frames,
+                    )
+                ),
+            )
         pose = target.get("pose_world") or {}
         if self.samples:
             previous_pose = self.samples[-1].get("pose_world") or {}
@@ -69,10 +90,10 @@ class SearchTargetLock:
                 self.samples = []
 
         self.samples.append(target)
-        self.samples = self.samples[-int(self.config.search_target_confirm_frames):]
+        self.samples = self.samples[-required_frames:]
         self.last_valid_time = now
 
-        if len(self.samples) >= int(self.config.search_target_confirm_frames):
+        if len(self.samples) >= required_frames:
             self.confirmed_target = self._build_confirmed_target()
             self.confirmed_time = now
 

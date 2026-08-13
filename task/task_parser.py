@@ -130,6 +130,8 @@ def _parse_task_payload(payload, original_message):
             ("粉色箱子", "pink box"),
             ("棕色方块", "brown box"),
             ("棕色盒子", "brown box"),
+            ("褐色方块", "brown box"),
+            ("褐色盒子", "brown box"),
             ("黄色方块", "yellow box"),
             ("黄色盒子", "yellow box"),
             ("pink", "pink box"),

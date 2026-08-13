@@ -40,8 +40,9 @@ class ActionConfig:
 
     control_rate_hz: float = 20.0
 
-    max_linear_speed: float = 0.7
-    max_angular_speed: float = 1.5
+    # Must stay within the DG safety gateway request limits.
+    max_linear_speed: float = 0.45
+    max_angular_speed: float = 1.20
     max_linear_accel: float = 0.80
     max_angular_accel: float = 2.20
 
@@ -53,7 +54,7 @@ class ActionConfig:
     task_use_fixed_home_pose: bool = True
     task_home_x: float = -0.70
     task_home_y: float = 0.55005
-    task_home_yaw: float = 1.5707963267948966 + 0.08
+    task_home_yaw: float = 1.5707963267948966 + 0.03
 
     # 先导航到观察/预抓取位姿，不直接贴到物体坐标。
     approach_distance_table: float = 0.55
@@ -129,6 +130,16 @@ class ActionConfig:
     close_range_lock_heading_tolerance_rad: float = 0.24
     close_range_lock_table_yaw_tolerance_rad: float = 0.24
     close_range_lock_allow_pregrasp_without_detection: bool = True
+    # 叠放目标接近后可能被图像上沿裁切。仅在任务明确描述“顶部/上方”、
+    # 检测颜色类别完全匹配且底盘已到安全站位时，允许锁住该目标。
+    stacked_target_lock_enable: bool = True
+    stacked_target_lock_min_dino_score: float = 0.40
+    stacked_target_lock_max_area_ratio: float = 0.58
+    stacked_target_lock_border_tolerance_px: float = 2.0
+    stacked_target_lock_min_visible_width_px: float = 80.0
+    stacked_target_lock_min_visible_height_px: float = 80.0
+    stacked_target_lock_goal_xy_tolerance_m: float = 0.10
+    stacked_target_lock_goal_yaw_tolerance_rad: float = 0.16
     # 就绪后不再用每一帧检测撤销状态，只监控底盘是否真的移动。
     ready_latch_xy_tolerance: float = 0.08
     ready_latch_yaw_tolerance: float = 0.12
@@ -148,8 +159,12 @@ class ActionConfig:
     # 官方镜像中头部控制接口已验证可用。
     enable_head_observe: bool = True
     enable_spine_observe: bool = True
+    # 总动作节点统一管理导航、抓取仿真、放置仿真和复位。
+    integrated_action_mode: bool = True
 
-    table_pick_x_range: tuple = (-1.45, -0.05)
+    # 桌面右侧目标可能接近 x=0.29；若上限仍为 -0.05，
+    # 目标会被强制截到左侧，视觉伺服永远无法消除横向误差。
+    table_pick_x_range: tuple = (-1.45, 0.25)
     table_pick_y_range: tuple = (1.42, 1.82)
     table_pregrasp_z0: float = 1.32163718
     table_pregrasp_spine_min: float = -0.04
@@ -193,6 +208,10 @@ class ActionConfig:
     pregrasp_head_pitch_min: float = -0.70
     pregrasp_head_pitch_max: float = -0.30
     pregrasp_head_pitch_step: float = 0.03  #头部俯仰速度
+
+    # 主动观察位姿必须先实际到位，再使用该位姿下的视觉帧。
+    observe_pose_settle_tolerance: float = 0.035
+    observe_pose_settle_timeout_sec: float = 1.2
     table_grasp_distance_min: float = 0.42
     table_grasp_distance_max: float = 0.60
 
@@ -201,16 +220,31 @@ class ActionConfig:
     repeat_observe_until_timeout: bool = False
     search_turn_timeout_sec: float = 20.0
     search_yaw_offsets: tuple = (0.0, 0.60, -0.60, 1.15, -1.15)
+    # 货架正面是固定几何区域。低层目标搜索时保持底盘朝向货架，
+    # 用头部左右补视覆盖横向位置，避免大角度底盘旋转把目标转到
+    # 图像边缘并将货架板面误当成目标深度。
+    shelf_search_yaw_offsets: tuple = (0.0,)
     # 搜索阶段不能由单帧开放词汇误检直接驱动底盘。
     search_target_confirm_frames: int = 2
+    # 任务总控已给出明确颜色、类别和来源时，搜索窗口可能只有一帧
+    # 候选；先生成远距离站位，到站后仍必须经过新鲜完整框和视觉伺服。
+    search_target_confirm_frames_task: int = 1
     search_target_max_gap_sec: float = 2.5
     search_target_lock_ttl_sec: float = 4.0
     search_target_pose_tolerance_m: float = 0.22
     search_target_min_dino_score: float = 0.38
-    # 赛事固定工作区的宽松边界，只用于拒绝明显落在墙面/地面的伪Pose3D。
+    # 任务已经提供颜色/类别/来源时，允许部分遮挡目标的 DINO 分数
+    # 降到这个值；颜色一致性、工作区和两帧位姿稳定性仍必须通过。
+    search_target_min_dino_score_task: float = 0.28
+    # 搜索阶段允许记录贴边候选作为线索；进入视觉伺服/ready 仍要求完整框。
+    # 远距离搜索允许真实目标轻微贴边，最终视觉伺服仍会要求完整框。
+    # 是否可信由下面的桌面物理范围进一步约束，避免墙边伪框驱动底盘。
+    search_allow_partial_table_bbox: bool = True
+    # 桌面目标中心的物理范围。官方场景桌面两侧目标中心约在
+    # x=-1.00..-0.18；将右边界收紧可拒绝桌面右缘/墙面反投影出的伪目标。
     table_target_bounds_xyz: tuple = (
-        (-1.90, 0.35),
-        (1.70, 2.70),
+        (-1.35, 0.05),
+        (1.70, 2.55),
         (0.68, 1.25),
     )
     shelf_target_bounds_xyz: tuple = (
@@ -242,14 +276,25 @@ class ActionConfig:
     )
 
     shelf_search_observe_sequence: tuple = (
-        ("shelf_search_center", 0.0, -0.20, 0.10, 1.6),
-        ("shelf_search_lower", 0.0, -0.42, 0.24, 1.8),
+        ("shelf_search_center", 0.0, -0.15, 0.12, 1.5),
+        ("shelf_search_lower", 0.0, -0.28, 0.28, 1.7),
+        # 实测低层粉色箱子的稳定视角：腰部约 0.50、头部俯仰
+        # -0.45 时目标完整位于画面中央。左右补视只作为兜底，
+        # 最后才使用更低的俯视角，避免目标被压到画面底边。
+        ("shelf_search_low_center", 0.0, -0.45, 0.50, 2.4),
+        ("shelf_search_low_left", 0.28, -0.45, 0.50, 2.0),
+        ("shelf_search_low_right", -0.28, -0.45, 0.50, 2.0),
+        ("shelf_search_lowest_center", 0.0, -0.58, 0.60, 2.0),
     )
 
     # grasp executor（抓取字段）
     enable_grasp_executor: bool = True
     grasp_auto_start: bool = False
     grasp_dry_run: bool = False
+    # 连续任务联调模式：导航到抓取位后自动推进抓取状态，不等待人工确认。
+    # 真实抓取动作接入完成后关闭此开关。
+    grasp_simulation_mode: bool = True
+    grasp_simulation_stage_sec: float = 0.6
     grasp_allow_unchecked_ik: bool = True
     grasp_require_manual_confirm: bool = True
     grasp_ready_max_age_sec: float = 3.0
@@ -343,6 +388,10 @@ class ActionConfig:
     # place skill（放置执行接口）
     place_command_topic: str = "/action/place_command"
     place_status_topic: str = "/action/place_status"
+    # 连续任务联调模式：导航到放置位后自动推进放置状态，不等待人工确认。
+    # 真实放置动作接入完成后关闭此开关。
+    place_simulation_mode: bool = True
+    place_simulation_stage_sec: float = 0.6
 
     # task-level navigation tolerances
     task_nav_xy_tolerance: float = 0.06

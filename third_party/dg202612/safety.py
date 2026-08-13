@@ -259,25 +259,44 @@ class SafetyGateway(Node):
         self.safe_output_cycles = 0
 
         self.cmd_vel_pub = self.create_publisher(Twist, "/cmd_vel", 5)
-        self.spine_pub = self.create_publisher(
-            Float64MultiArray,
-            "/spine_forward_position_controller/commands",
-            5,
+        # 未拥有的轴组不创建 publisher。这样整合动作模式下，ROS 图上也只
+        # 会留下总动作节点的头腰发布者，而不是“看似不发、实际仍可能抢占”的
+        # 第二个位置控制来源。
+        self.spine_pub = (
+            self.create_publisher(
+                Float64MultiArray,
+                "/spine_forward_position_controller/commands",
+                5,
+            )
+            if "spine" in self.owned_position_axes
+            else None
         )
-        self.head_pub = self.create_publisher(
-            Float64MultiArray,
-            "/head_forward_position_controller/commands",
-            5,
+        self.head_pub = (
+            self.create_publisher(
+                Float64MultiArray,
+                "/head_forward_position_controller/commands",
+                5,
+            )
+            if "head" in self.owned_position_axes
+            else None
         )
-        self.left_pub = self.create_publisher(
-            Float64MultiArray,
-            "/left_arm_forward_position_controller/commands",
-            5,
+        self.left_pub = (
+            self.create_publisher(
+                Float64MultiArray,
+                "/left_arm_forward_position_controller/commands",
+                5,
+            )
+            if "left_arm" in self.owned_position_axes
+            else None
         )
-        self.right_pub = self.create_publisher(
-            Float64MultiArray,
-            "/right_arm_forward_position_controller/commands",
-            5,
+        self.right_pub = (
+            self.create_publisher(
+                Float64MultiArray,
+                "/right_arm_forward_position_controller/commands",
+                5,
+            )
+            if "right_arm" in self.owned_position_axes
+            else None
         )
         self.runtime_pub = self.create_publisher(
             String, "/dg202612/runtime_state", 10
@@ -440,14 +459,15 @@ class SafetyGateway(Node):
         for name, payload in position_group_payloads(
             command, self.owned_position_axes
         ).items():
-            publishers[name].publish(Float64MultiArray(data=payload))
+            publisher = publishers[name]
+            if publisher is not None:
+                publisher.publish(Float64MultiArray(data=payload))
 
     def _publish_safe(self, now: float) -> None:
-        hold = stopped(self.last_output, now)
-        if hold is not None:
-            self._publish(hold)
-        elif self.emergency_stop:
-            self.cmd_vel_pub.publish(Twist())
+        # 位置控制器的语义是“不发布就保持当前设定点”。安全态不能把旧的
+        # last_output 再发给头部/腰部，否则会与导航节点的观察目标争抢同一
+        # 控制器，表现为头腰抽搐。安全状态只需要显式停止速度控制器。
+        self.cmd_vel_pub.publish(Twist())
 
     def tick(self) -> None:
         now = time.monotonic()

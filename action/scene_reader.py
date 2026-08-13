@@ -192,7 +192,16 @@ def choose_search_areas(task):
     ).lower()
 
     if support_surface == "table" or "table" in source_location:
-        return ["table_front"]
+        instruction = str(task.get("original_instruction") or "")
+        pickup_clause = instruction.split("放到", 1)[0].lower()
+        # 官方随机任务会在抓取子句中给出“桌面左侧/右侧”。
+        # 先去对应侧的观测点，避免桌前中点把侧边目标推到相机边缘；
+        # 另一侧仍保留为泛化兜底，适应没有侧别提示的任务。
+        if "右侧" in pickup_clause or "右边" in pickup_clause:
+            return ["table_front_right", "table_front_left"]
+        if "左侧" in pickup_clause or "左边" in pickup_clause:
+            return ["table_front_left", "table_front_right"]
+        return ["table_front_right", "table_front_left"]
     if support_surface == "shelf" or "shelf" in source_location:
         return ["shelf_front"]
 
@@ -201,7 +210,11 @@ def choose_search_areas(task):
     instruction = str(task.get("original_instruction") or "")
     pickup_clause = instruction.split("放到", 1)[0].lower()
     if "桌面" in pickup_clause or "桌子" in pickup_clause or "table" in pickup_clause:
-        return ["table_front"]
+        if "右侧" in pickup_clause or "右边" in pickup_clause:
+            return ["table_front_right", "table_front_left"]
+        if "左侧" in pickup_clause or "左边" in pickup_clause:
+            return ["table_front_left", "table_front_right"]
+        return ["table_front_right", "table_front_left"]
     if "货架" in pickup_clause or "shelf" in pickup_clause:
         return ["shelf_front"]
 
@@ -323,6 +336,12 @@ def target_is_visible_for_servo(scene, task, config):
 
 KNOWN_COLORS = ("pink", "brown", "yellow", "white")
 
+# Official scene geometry keeps the table height fixed while object XY
+# positions are randomized. A clipped RGB-D mask can sample the tabletop and
+# produce a near-zero world Z; use this only when the task already says that
+# the pick source is the table.
+OFFICIAL_TABLE_OBJECT_CENTER_Z = 0.834
+
 
 def _canonical_object_label(obj):
     """Return the post-processed label without mixing in stale raw labels."""
@@ -352,7 +371,7 @@ def _resolved_object_color(obj, canonical_label):
     return ""
 
 
-def _object_matches_task(obj, target):
+def _object_matches_task(obj, target, *, allow_partial_bbox=False):
     label = _canonical_object_label(obj)
     target_label = str(target.get("label") or "").lower()
     color = str(target.get("color") or "").lower()
@@ -384,7 +403,11 @@ def _object_matches_task(obj, target):
     # 桌面抓取目标必须是完整可见的独立物体。贴边或异常大的框通常
     # 是叠放箱体与桌面/相邻物体被SAM合并，不能让它替换上一帧目标。
     box = obj.get("box_xyxy") or []
-    if len(box) >= 4 and _canonical_support_surface(target) == "table":
+    if (
+        len(box) >= 4
+        and _canonical_support_surface(target) == "table"
+        and not allow_partial_bbox
+    ):
         x1, y1, x2, y2 = [float(value) for value in box[:4]]
         margin = 20.0
         area_ratio = (
@@ -423,6 +446,47 @@ def _object_matches_task(obj, target):
 
 
 def _copy_detection_to_target(target, detection, score):
+    expected_surface = _canonical_support_surface(target)
+    detected_surface = _canonical_support_surface(detection)
+    resolved_surface = detection.get("support_surface")
+    resolved_on_table = detection.get("on_table")
+    resolved_on_shelf = detection.get("on_shelf")
+    pose_world = detection.get("pose_world")
+
+    # The task contract is the stronger source-location cue. Keep a table
+    # candidate as a table target when its XY/depth estimate is otherwise
+    # usable; do not let one bad Z sample redirect the robot to another area.
+    if expected_surface == "table" and detected_surface != "shelf":
+        resolved_surface = "table"
+        resolved_on_table = True
+        resolved_on_shelf = False
+        if isinstance(pose_world, dict):
+            pose_world = dict(pose_world)
+            z = float(pose_world.get("z", 0.0))
+            if z < 0.55 or z > 1.35:
+                pose_world["z"] = OFFICIAL_TABLE_OBJECT_CENTER_Z
+    elif expected_surface == "shelf" and detected_surface != "table":
+        resolved_surface = "shelf"
+        resolved_on_table = False
+        resolved_on_shelf = True
+        # 近距离低层货架的 SAM 掩膜常会包含板面，导致深度中位数
+        # 落到 z≈0。任务合同已经明确目标来自货架，且检测的 XY
+        # 仍在货架范围内时，使用已推断出的层板高度恢复箱体中心 Z。
+        # 只修复明显无效的高度，不覆盖正常的深度结果，也不影响桌面任务。
+        if isinstance(pose_world, dict):
+            raw_z = float(pose_world.get("z", 0.0))
+            shelf_surface_z = detection.get("shelf_surface_z")
+            if (
+                shelf_surface_z is not None
+                and raw_z < 0.35
+            ):
+                pose_world = dict(pose_world)
+                pose_world["z"] = (
+                    float(shelf_surface_z)
+                    + 0.095
+                    + 0.010
+                )
+
     target.update(
         {
             "object_id": detection.get("object_id"),
@@ -438,14 +502,22 @@ def _copy_detection_to_target(target, detection, score):
             "raw_label": detection.get("raw_label"),
             "corrected_label": detection.get("corrected_label"),
             "estimated_color": detection.get("estimated_color"),
-            "pose_world": detection.get("pose_world"),
+            "color_consistent": detection.get("color_consistent"),
+            "color_scores": detection.get("color_scores"),
+            "pose_world": pose_world,
             "size_3d": detection.get("size_3d"),
-            "support_surface": detection.get("support_surface"),
-            "on_table": detection.get("on_table"),
-            "on_shelf": detection.get("on_shelf"),
+            "support_surface": resolved_surface,
+            "on_table": resolved_on_table,
+            "on_shelf": resolved_on_shelf,
             "shelf_layer": detection.get("shelf_layer"),
+            "support_surface_index": detection.get(
+                "support_surface_index"
+            ),
             "shelf_layer_confidence": detection.get(
                 "shelf_layer_confidence"
+            ),
+            "shelf_memory_fused": bool(
+                detection.get("shelf_memory_fused")
             ),
             "confidence": float(score),
             "requires_reobserve": False,
@@ -484,7 +556,20 @@ def target_is_plausible_for_search(task, area_name, config):
         return False, f"surface_{actual_surface}_expected_{expected_surface}"
 
     dino_score = float(target.get("dino_score") or 0.0)
-    if dino_score < float(config.search_target_min_dino_score):
+    target_label = str(target.get("label") or "").lower()
+    task_threshold = float(
+        getattr(
+            config,
+            "search_target_min_dino_score_task",
+            config.search_target_min_dino_score,
+        )
+    )
+    threshold = (
+        task_threshold
+        if target_label and target.get("color")
+        else float(config.search_target_min_dino_score)
+    )
+    if dino_score < threshold:
         return False, "dino_score_too_low"
 
     pose = target.get("pose_world") or {}
@@ -517,7 +602,9 @@ def target_is_plausible_for_search(task, area_name, config):
     # 在桌面搜索位看到的货架目标经常只露出画面底边一小块，
     # 深度反投影会把它误算成桌面附近目标。桌面候选必须完整落入画面，
     # 否则继续搜索下一个区域，避免把货架物体当成桌面物体去抓。
-    if expected_surface == "table":
+    if expected_surface == "table" and not bool(
+        getattr(config, "search_allow_partial_table_bbox", False)
+    ):
         margin = float(config.servo_bbox_margin_px)
         if (
             x1 < margin
@@ -529,7 +616,20 @@ def target_is_plausible_for_search(task, area_name, config):
 
     # 搜索阶段允许目标贴边：这里只用Pose3D生成较远的预抓取点。
     # 到达后target_is_visible_for_servo()仍会严格要求完整检测框。
-    if not (
+    if expected_surface == "shelf" and target.get("shelf_memory_fused"):
+        # 低层货架目标可能只露出画面边缘，但其世界坐标已经由同一
+        # 检测消息中的 shelf_object_levels 校正。允许用这个小框触发
+        # 货架预站位；到站后的视觉伺服仍要求完整目标框。
+        if not (
+            x2 > 0.0
+            and y2 > 0.0
+            and x1 < float(config.image_width)
+            and y1 < float(config.image_height)
+            and x2 - x1 >= 12.0
+            and y2 - y1 >= 12.0
+        ):
+            return False, "bbox_not_search_usable"
+    elif not (
         x2 > 0.0
         and y2 > 0.0
         and x1 < float(config.image_width)
@@ -543,21 +643,34 @@ def target_is_plausible_for_search(task, area_name, config):
 
 
 def _clear_stale_target(target):
+    # Keep the task contract (label/color/category and expected source area)
+    # when the current camera frame has no matching detection.  Only the
+    # frame-specific geometry is stale.  Clearing support_surface here makes
+    # a known table task look location-unknown and can incorrectly send the
+    # robot to shelf_front.
     for key in (
         "object_id",
-        "label",
         "box_xyxy",
         "centroid_uv",
         "mask_area",
         "pose_world",
         "size_3d",
-        "support_surface",
-        "on_table",
-        "on_shelf",
         "shelf_layer",
         "shelf_layer_confidence",
     ):
         target[key] = None
+
+    source_surface = _canonical_support_surface(target)
+    if source_surface == "table":
+        target["support_surface"] = "table"
+        target["source_location"] = "table"
+        target["on_table"] = True
+        target["on_shelf"] = False
+    elif source_surface == "shelf":
+        target["support_surface"] = "shelf"
+        target["source_location"] = "shelf"
+        target["on_table"] = False
+        target["on_shelf"] = True
 
     target["confidence"] = 0.0
     target["requires_reobserve"] = True
@@ -587,7 +700,7 @@ def target_is_servo_usable(task, config):
     )
 
 
-def bind_task_target_from_objects(scene, task):
+def bind_task_target_from_objects(scene, task, *, allow_partial_bbox=False):
     if not scene or not task:
         return task
 
@@ -605,7 +718,11 @@ def bind_task_target_from_objects(scene, task):
             if obj.get("object_id") != existing_id:
                 continue
 
-            existing_score = _object_matches_task(obj, target)
+            existing_score = _object_matches_task(
+                obj,
+                target,
+                allow_partial_bbox=allow_partial_bbox,
+            )
             if existing_score >= 1.0:
                 task["target"] = _copy_detection_to_target(
                     target,
@@ -617,9 +734,17 @@ def bind_task_target_from_objects(scene, task):
 
     best = max(
         objects,
-        key=lambda obj: _object_matches_task(obj, target),
+        key=lambda obj: _object_matches_task(
+            obj,
+            target,
+            allow_partial_bbox=allow_partial_bbox,
+        ),
     )
-    best_score = _object_matches_task(best, target)
+    best_score = _object_matches_task(
+        best,
+        target,
+        allow_partial_bbox=allow_partial_bbox,
+    )
 
     if best_score < 1.0:
         task["target"] = _clear_stale_target(target)
